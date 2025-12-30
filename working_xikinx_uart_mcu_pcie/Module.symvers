@@ -1,0 +1,4 @@
+0x637aad5f	mcu_pcie_register_irq_handler	/home/rafael/Downloads/filesthree/mcu_pcie	EXPORT_SYMBOL_GPL	
+0x50468119	mcu_pcie_unregister_irq_handler	/home/rafael/Downloads/filesthree/mcu_pcie	EXPORT_SYMBOL_GPL	
+0x94376fdc	mcu_pcie_get_pending	/home/rafael/Downloads/filesthree/mcu_pcie	EXPORT_SYMBOL_GPL	
+0xd0801fda	xdma_get_and_clear_pending	/home/rafael/Downloads/filesthree/mcu_pcie	EXPORT_SYMBOL_GPL	
