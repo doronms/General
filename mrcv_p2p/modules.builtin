@@ -1,0 +1,6 @@
+kernel/drivers/mfd/rafael/mcu_pcie.ko
+kernel/drivers/mfd/rafael/mcu_fpga.ko
+kernel/drivers/mfd/rafael/mcu_cpld.ko
+kernel/drivers/mfd/rafael/mcu_uart.ko
+kernel/drivers/mfd/rafael/mcu_quart.ko
+kernel/drivers/mfd/rafael/mcu_video_matrix.ko

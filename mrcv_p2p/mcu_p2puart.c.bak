@@ -1,0 +1,4093 @@
+/*
+ * P2PUART serial driver for Linux.
+ * The P2PUART IP block contains a single uart port.
+ * The driver supports IRQ sharing, so that multiple ports can share
+ * the same IRQ signal.
+ * Tested on the Xilinx ZCU102 board (A53 CPU) with Petalinux 2018.02 (Based
+ * on Linux kernel version 4.14).
+ * Relevant documents:
+ * #24550297 - ComCtrl FSID
+ * #23980326 - P2P_UART FSID
+ * #42142307 - P2PUART linux driver development notes
+ */
+
+#if defined(CONFIG_SERIAL_P2PUART_CONSOLE) && defined(CONFIG_MAGIC_SYSRQ)
+#define SUPPORT_SYSRQ
+#endif
+
+#include <linux/clk.h>
+#include <linux/console.h>
+#include <linux/delay.h>
+#include <linux/io.h>
+#include <linux/ioport.h>
+#include <linux/kernel.h>
+#include <linux/math64.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/serial_core.h>
+#include <linux/serial.h>
+#include <linux/slab.h>
+#include <linux/tty.h>
+#include <linux/tty_flip.h>
+#include <linux/timekeeping.h>
+#include <linux/version.h>
+#include <linux/printk.h>
+
+#include "p2puart_ioctls.h"
+#include "mcu_pcie.h"
+
+#define P2PUART_DESC "P2PUART Linux Serial Driver Over MCU PCIe"
+#define P2PUART_VER "1.13"
+
+/* Debug options:
+   DEBUG_PRINT_REGISTERS_ACCESS  - prints reads and writes from device
+                                   registers.
+   DEBUG_PRINT_DEVICE_MAPPINGS   - prints the device memory mappings.
+   DEBUG_PRINT_FUNCTION_ENTRIES  - prints entries into (some) driver
+                                   functions.
+   DEBUG_PRINT_FUNCTION_RETURNS  - prints returns from (some) driver
+                                   functions.
+   DEBUG_PRINT_BAUD_RATE_CALCS   - prints the baud rate calculations.
+   DEBUG_PRINT_TX_COMMANDS       - prints information about transmit commands
+                                   sent to the firmware.
+   DEBUG_PRINT_RX_INTERRUPT      - prints information in receive.
+                                   interrupts (type and size).
+   DEBUG_PRINT_PARITY            - prints parity setting.
+   DEBUG_WITH_UNITTEST_IOCTLS    - enable unit test ioctls.
+
+   DEBUG_PRINT_RX_BUFFERS        - Prints the contents of received (RX)
+                                   buffers.
+   DEBUG_PRINT_RX_BUFFERS_PORT_NUM=N - If set, limits the prints of received
+                                   (RX) buffers to the port number N (0 based);
+                                   Otherwise data from all ports will be
+                                   printed (assuming DEBUG_PRINT_RX_BUFFERS
+                                   is set).
+   DEBUG_PRINT_TX_BUFFERS        - Prints the contents of transmitted (TX)
+                                   buffers.
+   DEBUG_PRINT_TX_BUFFERS_PORT_NUM=N - If set, limits the prints of transmitted
+                                   (TX) buffers to the port number N (0 based);
+                                   Otherwise data from all ports will be
+                                   printed (assuming DEBUG_PRINT_TX_BUFFERS
+                                   is set).
+
+   Note: debug options should be set through EXTRA_CFLAGS. For example, in
+   order to build the driver with prints of received data only from port 0,
+   use the following make command:
+     make EXTRA_CFLAGS="-DDEBUG_PRINT_RX_BUFFERS -DDEBUG_PRINT_RX_BUFFERS_PORT_NUM=0"
+
+*/
+
+/* optional build defines:
+   DISABLE_MEMORY_BUFFERS_QUICK_TEST - Disables quick testing of memory
+                                       buffers (May be useful if Tx buffers
+                                       are not readable or Rx buffers are
+                                       not writable).
+*/
+
+//#define DISABLE_MEMORY_BUFFERS_QUICK_TEST
+
+#ifdef DEBUG_PRINT_FUNCTION_ENTRIES
+#define PRINT_FUNCTION_ENTRY(funcname)                                         \
+	printk("%s: entered %s()\n", to_p2puart_port(port)->name, funcname);
+#else
+#define PRINT_FUNCTION_ENTRY(funcname)
+#endif
+
+#ifdef DEBUG_PRINT_FUNCTION_RETURNS
+#define PRINT_FUNCTION_RETURN(funcname)                                        \
+	printk("%s: returning from %s()\n", to_p2puart_port(port)->name,       \
+	       funcname);
+#else
+#define PRINT_FUNCTION_RETURN(funcname)
+
+#endif
+
+#define PRINT_RX_BUFFERS_ALL_PORTS -1
+#define PRINT_TX_BUFFERS_ALL_PORTS -1
+
+#ifndef DEBUG_PRINT_RX_BUFFERS_PORT_NUM
+#define DEBUG_PRINT_RX_BUFFERS_PORT_NUM PRINT_RX_BUFFERS_ALL_PORTS
+#endif
+
+#ifndef DEBUG_PRINT_TX_BUFFERS_PORT_NUM
+#define DEBUG_PRINT_TX_BUFFERS_PORT_NUM PRINT_RX_BUFFERS_ALL_PORTS
+#endif
+
+#ifdef DEBUG_PRINT_RX_BUFFERS
+#define PRINT_RX_BUFFER(port, p, size)                                         \
+	if (DEBUG_PRINT_RX_BUFFERS_PORT_NUM == PRINT_RX_BUFFERS_ALL_PORTS ||   \
+	    DEBUG_PRINT_RX_BUFFERS_PORT_NUM == port->line) {                   \
+		char msg[128];                                                 \
+		printk("%s: <-- (len: %d bytes). Data: ", port->name, size);   \
+		sprintf(msg, "%s: <-- ", port->name);                          \
+		print_hex_dump(KERN_WARNING, msg, DUMP_PREFIX_OFFSET, 32, 1,   \
+			       p, size, false);                                \
+	}
+#else
+#define PRINT_RX_BUFFER(port, p, size)
+#endif
+
+#ifdef DEBUG_PRINT_TX_BUFFERS
+#define PRINT_TX_BUFFER(port, p, size)                                         \
+	if (DEBUG_PRINT_TX_BUFFERS_PORT_NUM == PRINT_TX_BUFFERS_ALL_PORTS ||   \
+	    DEBUG_PRINT_TX_BUFFERS_PORT_NUM == port->line) {                   \
+		char msg[128];                                                 \
+		printk("%s: --> (len: %d bytes). Data: ", port->name, size);   \
+		sprintf(msg, "%s: --> ", port->name);                          \
+		print_hex_dump(KERN_WARNING, msg, DUMP_PREFIX_OFFSET, 32, 1,   \
+			       p, size, false);                                \
+	}
+#else
+#define PRINT_TX_BUFFER(port, p, size)
+#endif
+
+/* Maximum number of P2PUART ports the driver will manage. */
+#define P2PUART_NR_MAX 32
+
+/* device name */
+#define P2PUART_TTY_NAME "ttyP2P"
+
+/* ======================================================================== */
+/* ComCtrl (common) registers                                               */
+/* ======================================================================== */
+
+/* Module Version Regsiter */
+#define COMCTRL_MVR 0x04
+
+/* Module Properties Register */
+#define COMCTRL_MPR 0x08
+
+/* Channel Properties Register */
+#define COMCTRL_CPR 0x0c
+
+/* Soft Reset register */
+#define SOFT_RESET 0x10
+
+#define RXBUF0_CTRL 0x14
+#define RXBUF1_CTRL 0x18
+
+#define TXBUF0_CTRL 0x1c
+#define TXBUF1_CTRL 0x20
+
+/* Interrupt Source Register */
+#define COMCTRL_ISR 0x24
+
+/* Interrupt Pending Register */
+#define COMCTRL_IPR 0x28
+
+/* Interrupt Mask Register */
+#define COMCTRL_IMR 0x2c
+
+/* Register that contains the address of the Tx Buffer.
+   Exists since ComCtrl 8.1 */
+#define COMCTRL_TX_BUF_ADDR_OFFSET 0x38
+
+/* Register that contains the address of the Rx Buffer.
+   Exists since ComCtrl 8.1 */
+#define COMCTRL_RX_BUF_ADDR_OFFSET 0x3c
+
+/* The module's clock frequency in KHz.
+   0x0 – the value is not applicable
+*/
+#define COMCTRL_CLK_FREQ_KHZ_MASK GENMASK(17, 0)
+
+/* The size of the physical receive buffer (sum of sizes of buffer 0 and
+buffer 1) in Kbytes.
+0x0 – Represents the maximum allowable DPR size 64Kbyte
+*/
+#define COMCTRL_RX_DPR_SIZE_SHIFT 20
+
+#define COMCTRL_RX_DPR_SIZE_MASK                                               \
+	GENMASK(COMCTRL_RX_DPR_SIZE_SHIFT + 5, COMCTRL_RX_DPR_SIZE_SHIFT)
+
+/* The size of the physical Tx buffer (sum of sizes of buffer 0 and
+buffer 1) in Kbytes.
+0x0 – Represents the maximum allowable DPR size 64Kbyte
+*/
+#define COMCTRL_TX_DPR_SIZE_SHIFT 26
+
+#define COMCTRL_TX_DPR_SIZE_MASK                                               \
+	GENMASK(COMCTRL_TX_DPR_SIZE_SHIFT + 5, COMCTRL_TX_DPR_SIZE_SHIFT)
+
+/* Magic values for the SOFT_RESET register */
+#define RESET_RX 0xdead0000
+#define RESET_RX_NORMAL_OPERATION 0xba5e0000
+#define RESET_TX 0xdead
+#define RESET_TX_NORMAL_OPERATION 0xba5e
+
+/* TxBuf_Ctrl Registers bits */
+
+#define TXBUF_PACKET_SIZE_SHIFT 16
+#define TXBUF_PACKET_SIZE_MASK GENMASK(30, 16)
+#define TX_START BIT(0)
+#define BUFF_TX_BUSY BIT(1)
+#define MUTE_ENABLE BIT(2)
+
+/* RxBuf_Ctrl Registers bits */
+
+#define RXBUF_LAST_ADDRESS_SHIFT 16
+#define RXBUF_LAST_ADDRESS_MASK                                                \
+	GENMASK(RXBUF_LAST_ADDRESS_SHIFT + 14, RXBUF_LAST_ADDRESS_SHIFT)
+
+#define RXBUF_BUFFER_DONE_MASK BIT(9)
+
+/* Error Indication #0 in RxBuf_Ctrl */
+#define COMCTRL_RXBUF_OVERRUN_ERROR BIT(0)
+
+/* Error bits in RxBuf_Ctrl */
+
+#define P2PUART_FRAME_ERROR BIT(1)
+#define P2PUART_BREAK_ERROR BIT(2)
+#define P2PUART_PARITY_ERROR BIT(3)
+/* TODO: P2PUART has more error bits. Think if we need to use them. */
+
+#define P2PUART_RXBUF_ALL_ERRORS_MASK                                          \
+	(P2PUART_FRAME_ERROR | P2PUART_BREAK_ERROR | P2PUART_PARITY_ERROR |    \
+	 COMCTRL_RXBUF_OVERRUN_ERROR)
+
+/* IPR bits */
+#define IPR_RX_PACKET_SIZE_DONE0 BIT(0)
+#define IPR_RX_PACKET_SIZE_DONE1 BIT(1)
+#define IPR_RX_LINK_DONE0 BIT(2)
+#define IPR_RX_LINK_DONE1 BIT(3)
+#define IPR_OVERRUN_ERROR0 BIT(4)
+#define IPR_OVERRUN_ERROR1 BIT(5)
+#define IPR_WINDOW_TIMEOUT_ERROR0 BIT(6)
+#define IPR_WINDOW_TIMEOUT_ERROR1 BIT(7)
+#define IPR_LAST_BUFFER BIT(15)
+#define IPR_TX_DONE0 BIT(16)
+#define IPR_TX_DONE1 BIT(17)
+
+#define IPR_RX0_MASK                                                           \
+	(IPR_RX_PACKET_SIZE_DONE0 | IPR_RX_LINK_DONE0 | IPR_OVERRUN_ERROR0 |   \
+	 IPR_WINDOW_TIMEOUT_ERROR0)
+
+#define IPR_RX1_MASK                                                           \
+	(IPR_RX_PACKET_SIZE_DONE1 | IPR_RX_LINK_DONE1 | IPR_OVERRUN_ERROR1 |   \
+	 IPR_WINDOW_TIMEOUT_ERROR1)
+
+#define IPR_RX_MASK (IPR_RX0_MASK | IPR_RX1_MASK)
+#define IPR_TX_MASK (IPR_TX_DONE0 | IPR_TX_DONE1)
+#define IPR_WINDOW_TIMEOUT_MASK GENMASK(7, 6)
+#define IPR_PHY_MASK GENMASK(31, 24)
+
+#define IPR_ALL_MASK                                                           \
+	(IPR_RX_MASK | IPR_TX_MASK | IPR_PHY_MASK | IPR_WINDOW_TIMEOUT_MASK)
+
+#define IMR_RX_MASK IPR_RX_MASK
+#define IMR_TX_MASK IPR_TX_MASK
+#define IMR_WINDOW_TIMEOUT_MASK IPR_WINDOW_TIMEOUT_MASK
+#define IMR_PHY_MASK IPR_PHY_MASK
+#define IMR_ALL_MASK IPR_ALL_MASK
+
+/* CPR bits */
+#define CPR_STREAMING_MODE_ENABLE_MASK BIT(6)
+
+#define CPR_END_OF_PACKET_CONDITION_TRIGGER_SHIFT 4
+
+#define CPR_END_OF_PACKET_CONDITION_TRIGGER_MASK                               \
+	GENMASK(CPR_END_OF_PACKET_CONDITION_TRIGGER_SHIFT + 1,                 \
+		CPR_END_OF_PACKET_CONDITION_TRIGGER_SHIFT)
+
+#define CPR_NO_RECEIVE_WHILE_TRANSMIT_MASK BIT(2)
+
+#define CPR_LOOPBACK_MASK GENMASK(1, 0)
+
+#define CPR_RX_PACKET_SIZE_SHIFT 16
+#define CPR_RX_PACKET_SIZE_MASK                                                \
+	GENMASK(CPR_RX_PACKET_SIZE_SHIFT + 14, CPR_RX_PACKET_SIZE_SHIFT)
+
+/* Loopback modes */
+#define LOOPBACK_NONE 0x0
+#define LOOPBACK_COMCTRL 0x1
+#define LOOPBACK_ENDPOINT 0x2
+#define LOOPBACK_EXTERNAL 0x3
+
+/* An End_of_Packet condition shall be generated only when the end-point
+asserts RX_LINK_DONE */
+#define CPR_EOP_LINK_DONE 0x0
+
+/* An End_of_Packet condition shall be generated only when the received
+number of characters is equal to the value specified by the host in the
+Rx_Packet_Size field */
+#define CPR_EOP_PACKET_SIZE 0x1
+
+/* Both RX-Link-Done and RX_Packet_Size shall cause an End Of Packet
+condition. */
+#define CPR_EOP_BOTH 0x2
+
+/* ======================================================================== */
+/* P2P Uart registers */
+/* ======================================================================== */
+
+/* Baud Rate Register */
+#define P2P_BAUD_RATE 0x64
+
+/* Specific Channel Properties Register */
+#define P2P_SCP 0x60
+
+/* Specific Capabilities Register */
+#define P2P_SCAP 0x80
+
+#define BAUD_RATE_D_MASK GENMASK(15, 0)
+#define BAUD_RATE_N_SHIFT 16
+
+#define BAUD_RATE_N_MASK GENMASK(BAUD_RATE_N_SHIFT + 15, BAUD_RATE_N_SHIFT)
+
+#define SCP_TX_PARITY_MASK GENMASK(2, 0)
+
+#define SCP_RX_PARITY_SHIFT 4
+
+#define SCP_RX_PARITY_MASK GENMASK(SCP_RX_PARITY_SHIFT + 2, SCP_RX_PARITY_SHIFT)
+
+#define SCP_TX_NUMBER_OF_STOP_BITS_SHIFT 8
+
+#define SCP_TX_NUMBER_OF_STOP_BITS_MASK                                        \
+	GENMASK(SCP_TX_NUMBER_OF_STOP_BITS_SHIFT + 1,                          \
+		SCP_TX_NUMBER_OF_STOP_BITS_SHIFT)
+
+#define SCP_1_STOP_BIT                                                         \
+	((0x0 << SCP_TX_NUMBER_OF_STOP_BITS_SHIFT) &                           \
+	 SCP_TX_NUMBER_OF_STOP_BITS_MASK)
+
+#define SCP_2_STOP_BITS                                                        \
+	((0x2 << SCP_TX_NUMBER_OF_STOP_BITS_SHIFT) &                           \
+	 SCP_TX_NUMBER_OF_STOP_BITS_MASK)
+
+#define SCP_PARITY_EVEN 0x0
+#define SCP_PARITY_ODD 0x1
+#define SCP_PARITY_NONE 0x2
+#define SCP_PARITY_MARK 0x3
+#define SCP_PARITY_SPACE 0x4
+#define SCP_PARITY_WAKEUP 0x5
+
+#define SCP_TRANSCEIVER_TERMINATION_MASK BIT(12)
+
+#define SCP_CHARACTER_TIMEOUT_PERIOD_SHIFT 16
+#define SCP_CHARACTER_TIMEOUT_PERIOD_MASK                                      \
+	GENMASK(SCP_CHARACTER_TIMEOUT_PERIOD_SHIFT + 7,                        \
+		SCP_CHARACTER_TIMEOUT_PERIOD_SHIFT)
+
+#define SCAP_MAXIMUM_BAUD_RATE_KBPS_MASK GENMASK(15, 0)
+
+#define SCAP_FULL_HALF_DUPLEX_SHIFT 20
+#define SCAP_FULL_HALF_DUPLEX_MASK                                             \
+	GENMASK(SCAP_FULL_HALF_DUPLEX_SHIFT + 1, SCAP_FULL_HALF_DUPLEX_SHIFT)
+
+#define SCAP_ALWAYS_HALF_DUPLEX 0x0
+
+#define SCAP_TRANSCEIVER_TERMINATION_SHIFT 24
+#define SCAP_TRANSCEIVER_TERMINATION_MASK                                      \
+	GENMASK(SCAP_TRANSCEIVER_TERMINATION_SHIFT + 1,                        \
+		SCAP_TRANSCEIVER_TERMINATION_SHIFT)
+
+#define SCAP_RX_CHANNEL_EXISTS BIT(28)
+#define SCAP_TX_CHANNEL_EXISTS BIT(29)
+
+/* ======================================================================== */
+/* General definitions                                                      */
+/* ======================================================================== */
+
+#define RX_BUFFER_0 0
+#define RX_BUFFER_1 1
+#define RX_BUFFERS_0_AND_1 2
+
+#define MAX_BAUD_RATE_ERROR_PERCENTS 3
+
+#define P2PUART_LINUX_PORT_TYPE PORT_16550A
+#define P2PUART_PORT_TYPE_STRING "16550A"
+
+#define P2PUART_DEFAULT_CHARACTER_TIMEOUT 3
+
+/* ======================================================================== */
+/* transceiver_termination                                                  */
+/* ======================================================================== */
+#define TRANSCEIVER_TERMINATION_NONE 0x0
+#define TRANSCEIVER_TERMINATION_CONSTANT 0x1
+#define TRANSCEIVER_TERMINATION_CONTROLLABLE 0x2
+
+
+#define P2PUART_TX_START_MAX_RETRIES   32   /* safety bound for handshake loop */
+
+
+#define IMR_RX_DONE_MASK (IPR_RX_PACKET_SIZE_DONE0 | IPR_RX_PACKET_SIZE_DONE1 | \
+                          IPR_RX_LINK_DONE0 | IPR_RX_LINK_DONE1)
+
+#define IMR_RX_ERR_MASK  (IPR_OVERRUN_ERROR0 | IPR_OVERRUN_ERROR1 | IPR_WINDOW_TIMEOUT_MASK)
+
+#define IMR_RX_ALL_MASK  (IMR_RX_DONE_MASK | IMR_RX_ERR_MASK)
+
+
+
+/* ======================================================================== */
+/* Types                                                                    */
+/* ======================================================================== */
+
+struct p2puart_port {
+	struct uart_port port;
+	char name[16];
+	bool rx_channel_exists;
+	bool tx_channel_exists;
+	unsigned int maximum_baud_rate_khz;
+
+	/* 0=half, 1=full, 2=controllable */
+	unsigned int full_half_duplex_capability;
+
+	/* 0=none, 1=constant, 2=controllable */
+	unsigned int transceiver_termination_capability;
+
+	unsigned int next_tx_buffer; /* 0/1 */
+	unsigned int next_rx_buffer; /* 0/1 */
+	unsigned int rx_buffer_size; /* Size of each Rx buffer, in bytes */
+	unsigned int rx_buffer_offset[2];
+	unsigned int tx_buffer_size; /* Size of each Tx buffer, in bytes */
+	unsigned int tx_buffer_offset[2];
+	bool mute_enabled;
+	unsigned int loopback; /* loopback mode */
+	bool no_receive_while_transmit;
+	bool streaming; /* streaming mode */
+
+	/* 0=Even,1=Odd, 2=None, 3=Mark, 4=Space, 5=Wakeup */
+	unsigned int parity;
+
+	/* wakeup_parity_mode: 0/1. If 1, parity setting of 3 (Mark) will
+	be treated as wakeup parity. */
+	unsigned int wakeup_parity_mode; /* 0/1 */
+
+	/* 1=1 stop bit, 2=2 stop bits. Note: firmware has a different
+	representation. */
+	unsigned int number_of_stop_bits;
+
+	unsigned int termination_enable;
+
+	/* in character time units. 1..256 */
+	unsigned int character_timeout_period;
+
+	bool rx_enabled;
+	unsigned int previous_packet_size_last_address[2];
+	
+	bool throttle_state;
+	
+	unsigned int rx_packet_size; /* 1..rx_buffer_size */
+
+	unsigned long requested_baud_rate;
+	unsigned long calculated_baud_rate;
+
+	/* Raised before we start transmitting though a buffer.
+	Lowered when we handle the Tx_Done interrupt.
+	Note that we cannot use Buff_Tx_Busy from the Tx_Buf_Ctrl
+	registers for this purpose because its value is cleared
+	slightly before the PHY finishing transmitting.
+	We assume that Tx_Done interrupts are received in correct
+	timing, i.e. after the PHY finishes the transmit operation. */
+	bool tx_buffer_busy[2];
+
+	unsigned char *temp_rx_buffer;
+#if 0
+	struct device_attribute mode_attr; /* mode value */
+	struct device_attribute modesz_attr; /* mode string */
+	unsigned int mode;
+
+	struct device_attribute nrwt_attr; /* no_receive_while_transmit */
+
+	void *ttybp;
+	wait_queue_head_t tx_buf_idle_ev[2];
+#endif	
+};
+
+/* ======================================================================== */
+/* Static variables                                                         */
+/* ======================================================================== */
+
+static struct p2puart_port *p2puart_ports[P2PUART_NR_MAX];
+static int p2puart_ports_num;
+
+/* ======================================================================== */
+/* Forward declarations                                                     */
+/* ======================================================================== */
+
+static void p2puart_update_scp(struct uart_port *port);
+static struct p2puart_port *to_p2puart_port(struct uart_port *port);
+
+//int wait_for_txbuf(struct uart_port *port, struct bufinf *bufinf);
+
+/* ======================================================================== */
+/* Functions                                                                */
+/* ======================================================================== */
+
+/* Calculates values for the N and D fields of the baud rate register
+ * according to the desired baud rate.
+ * Notes:
+ * 1. The calculated values of N and D may produce a baud rate that is
+ *    slightly different than the desired baud rate.
+ *    Usually UARTs can tolerate small variations in the baud rate.
+ *    This function will return the calculated baud rate, so that the
+ *    caller can decide whether or not to accept such variation.
+ * 2. The firmware treats values of 0 (in n and d) as 2^16.
+ * 3. In order to update the baud rate register, the firmware
+ *    needs to be put in a Soft Reset state.
+ * Returns the baud rate that will result from the calculation,
+ * or 0 if the desired baud rate can not be produced.
+*/
+static unsigned long p2puart_calc_baud_divs(unsigned long clock_freq_hz,
+					    unsigned long baud, uint16_t *n,
+					    uint16_t *d)
+{
+	unsigned long baud_n;
+	unsigned long baud_d;
+	unsigned long largest;
+	unsigned long cur_baud;
+	unsigned long calc_baud;
+	unsigned long baud_error;
+	unsigned long min_baud_error;
+	unsigned long best_n;
+	unsigned long best_d;
+
+	min_baud_error = baud;
+	best_n = 0;
+	best_d = 0;
+
+	if ((8 * baud) > clock_freq_hz) {
+		*n = 0;
+		*d = 0;
+		return 0;
+	}
+
+	largest = (1 << 16); /* 2^16 */
+
+	for (baud_n = 1; baud_n <= largest; ++baud_n) {
+		baud_d = DIV_ROUND_CLOSEST_ULL(
+			(unsigned long long)baud * 8 * baud_n, clock_freq_hz);
+		if (0 == baud_d)
+			continue;
+		cur_baud = div_u64(((unsigned long long)clock_freq_hz * baud_d),
+				   (8 * baud_n));
+
+		baud_error =
+			(baud > cur_baud ? baud - cur_baud : cur_baud - baud);
+		if (baud_error < min_baud_error) {
+			min_baud_error = baud_error;
+			best_n = baud_n;
+			best_d = baud_d;
+		}
+	}
+
+	baud_n = best_n;
+	baud_d = best_d;
+
+	/* If baud_n is 2^16, set it to 0 */
+	if (baud_n == largest)
+		baud_n = 0;
+	/* If baud_d is 2^16, set it to 0 */
+	if (baud_d == largest)
+		baud_d = 0;
+
+	/* Return the values of baud_n and baud_d to the caller through the
+	pointers n and d. */
+	*n = baud_n;
+	*d = baud_d;
+
+	/* Calculate the baud rate. */
+	if (0 == baud_n)
+		baud_n = largest;
+	if (0 == baud_d)
+		baud_d = largest;
+	calc_baud = (unsigned long)div_u64(
+		((unsigned long long)clock_freq_hz * baud_d), (8 * baud_n));
+
+	return calc_baud;
+}
+
+
+
+/**
+ * Casts a uart_port pointer to a p2puart_port pointer.
+ * The uart_port struct is embedded inside the p2puart_port structure.
+ * @param port A pointer to the uart_port structure.
+ * @return A pointer to the p2puart_port struct.
+ */
+static struct p2puart_port *to_p2puart_port(struct uart_port *port)
+{
+	return container_of(port, struct p2puart_port, port);
+}
+
+/**
+ * Reads a value from a device register.
+ * Reads a value from a 32 bit device register.
+ * @param port A pointer to the uart_port structure.
+ * @param offset Register offset, relative to device's base address.
+ * @return The value read from the register.
+ */
+static uint32_t p2puart_serial_in(struct uart_port *port, int offset)
+{
+	uint32_t regval;
+
+	PRINT_FUNCTION_ENTRY("p2puart_serial_in");
+
+	regval = ioread32(port->membase + offset);
+
+#ifdef DEBUG_PRINT_REGISTERS_ACCESS
+	printk("%s: read 0x%08llx (value:0x%08llx)\n",
+	       to_p2puart_port(port)->name,
+	       (unsigned long long)(port->mapbase + offset),
+	       (unsigned long long)regval);
+#endif
+
+	return regval;
+}
+
+/**
+ * Writes a value to a device register.
+ * Writes a value to a 32 bit device register.
+ * @param port A pointer to the uart_port structure.
+ * @param offset Register offset, relative to device's base address.
+ * @param value Value to write.
+ */
+static void p2puart_serial_out(struct uart_port *port, int offset,
+			       uint32_t value)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_serial_out");
+
+#ifdef DEBUG_PRINT_REGISTERS_ACCESS
+	printk("%s: write 0x%08llx 0x%08llx\n", to_p2puart_port(port)->name,
+	       (unsigned long long)(port->mapbase + offset),
+	       (unsigned long long)value);
+#endif
+	iowrite32(value, port->membase + offset);
+	ioread32(port->membase + offset); // shemie 
+}
+
+static void p2puart_unmask_all_interrupts(struct uart_port *port)
+{
+	/* Assuming 1 = masked, 0 = enabled for all bits in IMR */
+	p2puart_serial_out(port, COMCTRL_IMR, 0x00000000);
+}
+
+/**
+ * Returns the memory offset of a TxBuf_Ctrl register.
+ * This function returns the memory offset (relative to the beginning of the
+ * device's address space) where a TxBuf_Ctrl register is placed.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ * @return The offset of the requested TxBuf_Ctrl register.
+ */
+static unsigned int
+p2puart_get_tx_ctrl_register_offset(unsigned int buffer_number)
+{
+	if (buffer_number)
+		return TXBUF1_CTRL;
+	return TXBUF0_CTRL;
+}
+
+/**
+ * Raises the reset Tx in Soft Reset.
+ * Raises the Reset Tx bit in the Soft Reset register.
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_raise_reset_tx(struct uart_port *port)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_raise_reset_tx");
+
+	p2puart_serial_out(port, SOFT_RESET, RESET_TX);
+	udelay(1);
+}
+
+/**
+ * Raises both Reset Rx and Reset Tx in Soft Reset.
+ * Raises both the Reset Rx and Reset Tx bits in the Soft Reset register.
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_raise_reset_rx_and_tx(struct uart_port *port)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_raise_reset_rx_and_tx");
+
+	p2puart_serial_out(port, SOFT_RESET, RESET_RX | RESET_TX);
+	udelay(1);
+	to_p2puart_port(port)->next_rx_buffer = 0;
+}
+
+/**
+ * Lowers the reset Tx in Soft Reset.
+ * Lowers the Reset Tx bit in the Soft Reset register.
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_lower_reset_tx(struct uart_port *port)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_lower_reset_tx");
+
+	p2puart_serial_out(port, SOFT_RESET, RESET_TX_NORMAL_OPERATION);
+	udelay(1);
+}
+
+/**
+ * Lowers both Reset Rx and Reset Tx in Soft Reset.
+ * Lowers both the Reset Rx and Reset Tx bits in the Soft Reset register.
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_lower_reset_rx_and_tx(struct uart_port *port)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_lower_reset_rx_and_tx");
+
+	p2puart_serial_out(port, SOFT_RESET,
+			   RESET_RX_NORMAL_OPERATION |
+				   RESET_TX_NORMAL_OPERATION);
+	udelay(1);
+}
+
+/**
+ * Gets the clock frequency of the device.
+ * Gets the clock frequency of the P2PUART device from the Module Properties
+ * Register, in Hz.
+ * @param port A pointer to the uart_port structure.
+ * @return the device's clock frequency, in Hz.
+ */
+static unsigned int p2puart_get_clock_frequency(struct uart_port *port)
+{
+	uint32_t mpr; /* Module Properties Register */
+	unsigned int freq_khz;
+	unsigned int freq; /* in Hz */
+
+	PRINT_FUNCTION_ENTRY("p2puart_get_clock_frequency");
+
+	mpr = p2puart_serial_in(port, COMCTRL_MPR);
+	freq_khz = mpr & COMCTRL_CLK_FREQ_KHZ_MASK;
+	freq = freq_khz * 1000;
+	return freq;
+}
+
+/**
+ * Converts CTO value from raw to physical.
+ * Converts the Character Timeout value from raw (register level) to
+ * physical (in character time units).
+ * @param character_time_out A raw CTO value.
+ * @return The corresponding physical CTO value.
+ */
+static uint32_t p2puart_cto_raw_to_physical(uint8_t character_time_out)
+{
+	/* Raw value of 0 means 256 characters. */
+	if (0 == character_time_out)
+		return 256;
+	return (uint32_t)character_time_out;
+}
+
+/**
+ * Converts CTO value from physical to raw.
+ * Converts the Character Timeout value from physical (in character time
+ * units) to raw (register level).
+ * @param character_time_out A physical CTO value.
+ * @return The corresponding raw CTO value.
+ */
+static uint8_t p2puart_cto_physical_to_raw(uint32_t character_time_out)
+{
+	/* Physical value of 256 is represented using raw value 0. */
+	if (256 == character_time_out)
+		return 0;
+	return (uint8_t)character_time_out;
+}
+
+/**
+ * Returns the character timeout period from the device.
+ * Returns the character timeout (CTO) period from the device, converted to
+ * physical value (in character time units).
+ * @param port A pointer to the uart_port structure.
+ * @return Physical value of character time (in character time units).
+ */
+static unsigned int p2puart_get_character_timeout_period(struct uart_port *port)
+{
+	uint32_t scp;
+	unsigned int timeout_period;
+
+	PRINT_FUNCTION_ENTRY("p2puart_get_character_timeout_period");
+
+	scp = p2puart_serial_in(port, P2P_SCP);
+	timeout_period = ((scp & SCP_CHARACTER_TIMEOUT_PERIOD_MASK) >>
+			  SCP_CHARACTER_TIMEOUT_PERIOD_SHIFT);
+	timeout_period = p2puart_cto_raw_to_physical(timeout_period);
+	return timeout_period;
+}
+
+/**
+ * Returns the size of a Tx buffer.
+ * Returns the size of a Tx buffer in bytes.
+ * We return the size of a single Tx buffer. (The device uses two Tx buffers).
+ * @param port A pointer to the uart_port structure.
+ * @return The size in bytes of a single Tx buffer.
+ */
+static unsigned int p2puart_get_tx_buffer_size(struct uart_port *port)
+{
+	uint32_t mpr;
+	unsigned int tx_dpr_size_kb;
+	unsigned int tx_buffer_size; /* In bytes */
+
+	PRINT_FUNCTION_ENTRY("p2puart_get_tx_buffer_size");
+
+	mpr = p2puart_serial_in(port, COMCTRL_MPR);
+	tx_dpr_size_kb =
+		((mpr & COMCTRL_TX_DPR_SIZE_MASK) >> COMCTRL_TX_DPR_SIZE_SHIFT);
+
+	if (!tx_dpr_size_kb)
+		tx_dpr_size_kb = 64;
+
+	tx_buffer_size = (tx_dpr_size_kb * 1024) / 2;
+//	printk("TX BUFFER SIZE: %d, ",tx_buffer_size);
+	return tx_buffer_size;
+}
+
+/**
+ * Returns the size of an Rx buffer.
+ * Returns the size of an Rx buffer in bytes.
+ * We return the size of a single Rx buffer. (The device uses two Rx buffers).
+ * @param port A pointer to the uart_port structure.
+ * @return The size in bytes of a single Rx buffer.
+ */
+static unsigned int p2puart_get_rx_buffer_size(struct uart_port *port)
+{
+	uint32_t mpr;
+	unsigned int rx_dpr_size_kb;
+	unsigned int rx_buffer_size; /* In bytes */
+
+	PRINT_FUNCTION_ENTRY("p2puart_get_rx_buffer_size");
+
+	mpr = p2puart_serial_in(port, COMCTRL_MPR);
+	rx_dpr_size_kb =
+		((mpr & COMCTRL_RX_DPR_SIZE_MASK) >> COMCTRL_RX_DPR_SIZE_SHIFT);
+	if (!rx_dpr_size_kb)
+		rx_dpr_size_kb = 64;
+
+	rx_buffer_size = (rx_dpr_size_kb * 1024) / 2;
+	return rx_buffer_size;
+}
+
+/**
+ * Returns Buff_Tx_Busy.
+ * Returns the Buff_Tx_Busy bit from the TxBuf_Ctrl Register.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ */
+static bool p2puart_is_tx_buffer_busy(struct uart_port *port,
+				      unsigned int buffer_number)
+{
+	unsigned int tx_ctrl_register_offset;
+	uint32_t regval;
+
+	PRINT_FUNCTION_ENTRY("p2puart_is_tx_buffer_busy");
+
+	tx_ctrl_register_offset =
+		p2puart_get_tx_ctrl_register_offset(buffer_number);
+
+	regval = p2puart_serial_in(port, tx_ctrl_register_offset);
+	return (regval & BUFF_TX_BUSY);
+}
+
+/**
+ * Serial driver tx_empty().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ * @return TIOCSER_TEMT (0x1) when the transmitter is empty;
+ * 0 otherwise.
+ */
+static unsigned int p2puart_tx_empty(struct uart_port *port)
+{
+	/* TODO: According to firmware engineers, we should not use
+	Buff_Tx_Busy for this purpose, because it is indeed lowered
+	before the PHY finishes transmitting the last character.
+	Even using a logical OR of Buff_Tx_Busy and Tx_Busy (bits 1 and
+	8 in Tx_Buf_Ctrl) is not expected to work (because Tx_Busy is
+	lowered between characters).
+	The recommended way is to use the Interrupt Pending Register (IPR)
+	and possibly also Interrupt Source Register (ISR) instread (when
+	working without interrupts we may need to use also the later
+	register).
+	Note that IPR bits are reset by our interrupt handler, so we
+	should remember the current transmitter state (i.e. whether we are
+	in a middle of a transmit or not). */
+
+	struct p2puart_port *pp = to_p2puart_port(port);
+	unsigned long flags;
+	bool busy;
+
+	PRINT_FUNCTION_ENTRY("p2puart_tx_empty");
+
+	spin_lock_irqsave(&port->lock, flags);
+	busy = pp->tx_buffer_busy[0] || pp->tx_buffer_busy[1];
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	if (busy)
+		return 0;
+
+	return TIOCSER_TEMT; /* 0x1 */
+}
+
+/**
+ * Serial driver get_mctrl().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ * @return The required value according to kernel documentation.
+ */
+static unsigned int p2puart_get_mctrl(struct uart_port *port)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_get_mctrl");
+
+	/* The port does not support CTS, DCD or DSR, hence the driver
+	 * indicates that these signals are permanently active. */
+	return TIOCM_CTS | TIOCM_DSR | TIOCM_CAR;
+}
+
+/**
+ * Serial driver set_mctrl().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * This function does nothing because the port does not have any modem
+ * control line.
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_set_mctrl(struct uart_port *port, unsigned int mctrl)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_set_mctrl");
+
+	/* nothing to do */
+}
+
+/**
+ * Serial driver stop_tx().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_stop_tx(struct uart_port *port)
+{
+	uint32_t imr;
+	uint32_t ipr;
+	struct p2puart_port *pp = to_p2puart_port(port);
+
+	PRINT_FUNCTION_ENTRY("p2puart_stop_tx");
+
+	/* Save value of IMR, because Tx reset resets the transmit part of
+	IPR, ISR and IMR. */
+	imr = p2puart_serial_in(port, COMCTRL_IMR);
+
+	/* Reset tx, in order to stop transmission as soon as possible. */
+	mb();
+	p2puart_raise_reset_tx(port);
+	mb();
+	p2puart_lower_reset_tx(port);
+	mb();
+
+	/* Read IPR */
+	ipr = p2puart_serial_in(port, COMCTRL_IPR);
+
+	/* If Tx Done 0/1 is bit is set in IPR, clear it, so that ISR will
+	ignore the interrupt. */
+	if (ipr & (IPR_TX_DONE0 | IPR_TX_DONE1)) {
+		ipr &= (IPR_TX_DONE0 | IPR_TX_DONE1);
+		p2puart_serial_out(port, COMCTRL_IPR, ipr);
+	}
+
+	/* Restore saved value of IMR. */
+	p2puart_serial_out(port, COMCTRL_IMR, imr);
+
+	pp->next_tx_buffer = 0;
+}
+
+/**
+ * Issues a Tx start command.
+ * Sets the packet size and issues a Tx start command by writing
+ * to the appropriate TxBuf_Ctrl register.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ * @param packet_size The size of the packet to transmit, in bytes.
+ */
+static bool p2puart_issue_tx_start_command(struct uart_port *port,
+                                           int buffer_number,
+                                           u32 packet_size)
+{
+    struct p2puart_port *pp = to_p2puart_port(port);
+    unsigned int tx_ctrl_off =
+        p2puart_get_tx_ctrl_register_offset(buffer_number);
+    u32 ctrl = 0;
+    int attempt;
+
+    /*
+     * Build the TxBuf_Ctrl value:
+     *  - optional MUTE_ENABLE bit
+     *  - packet size in TXBUF_PACKET_SIZE field
+     *  - TX_START bit (added in the loop)
+     */
+    if (pp->mute_enabled)
+        ctrl |= MUTE_ENABLE;
+
+    ctrl |= (packet_size << TXBUF_PACKET_SIZE_SHIFT) &
+            TXBUF_PACKET_SIZE_MASK;
+
+    /*
+     * Spec 6.1.1:
+     *  1. Poll Buff_Tx_Busy until cleared
+     *  2. Assert Tx_Start and set TxBuf_Packet_Size
+     *  3. Poll Buff_Tx_Busy: if asserted – done, else go back to step 2
+     *
+     * p2puart_handle_tx() already avoids calling us while BUFF_TX_BUSY is
+     * set, but we still follow the full sequence here for robustness.
+     */
+
+    /* Step 1: make sure buffer is idle */
+    for (attempt = 0; attempt < P2PUART_TX_START_MAX_RETRIES; ++attempt) {
+        u32 reg = p2puart_serial_in(port, tx_ctrl_off);
+
+        if (!(reg & BUFF_TX_BUSY))
+            break;
+
+        cpu_relax();
+    }
+
+    /* Still busy – don't start a new packet */
+    if (p2puart_serial_in(port, tx_ctrl_off) & BUFF_TX_BUSY) {
+        dev_warn(pp->port.dev,
+                 "p2puart: TX buf %d still busy, cannot start packet (size=%u)\n",
+                 buffer_number, packet_size);
+        return false;
+    }
+
+    /* Steps 2 + 3: issue TX_START and verify that BUFF_TX_BUSY asserted */
+    for (attempt = 0; attempt < P2PUART_TX_START_MAX_RETRIES; ++attempt) {
+        u32 reg;
+
+        /* Step 2: assert Tx_Start with packet size */
+        p2puart_serial_out(port, tx_ctrl_off, ctrl | TX_START);
+
+        /* MMIO read both flushes the write and checks BUFF_TX_BUSY */
+        reg = p2puart_serial_in(port, tx_ctrl_off);
+
+        /* Step 3: BUFF_TX_BUSY must go high to confirm HW accepted the command */
+        if (reg & BUFF_TX_BUSY) {
+            pp->tx_buffer_busy[buffer_number] = true;
+            return true;
+        }
+
+        cpu_relax();
+    }
+
+    /*
+     * If we're here, the core never raised BUFF_TX_BUSY after multiple
+     * attempts. According to the spec, that means Tx_Start was not
+     * latched. Treat as a hard TX error for this buffer.
+     */
+    dev_err(pp->port.dev,
+            "p2puart: TX_START handshake failed on buf %d (size=%u)\n",
+            buffer_number, packet_size);
+    return false;
+}
+
+
+#if 0 /* shemie */
+static void p2puart_issue_tx_start_command_flip_bufs(struct uart_port *port,
+						     unsigned int buffer_number,
+						     unsigned int packet_size)
+{
+	struct p2puart_port *pp = to_p2puart_port(port);
+
+	p2puart_issue_tx_start_command(port, buffer_number, packet_size);
+
+	/* flip the next Tx buffer number */
+	pp->next_tx_buffer = !buffer_number;
+}
+#endif 
+/**
+ * Transmits a high priority character.
+ * Transmits a high priority character.
+ * Called from p2puart_handle_tx when port->x_char is set.
+ * Clears port->x_char.
+ * @param port A pointer to the uart_port structure.
+ * @param x_char The high priority character to transmit.
+ */
+static void p2puart_transmit_xchar(struct uart_port *port, char x_char)
+{
+	struct p2puart_port *pp = to_p2puart_port(port);
+	unsigned int current_tx_buffer;
+	unsigned int buffer_offset;
+	uint32_t x;
+
+	current_tx_buffer = pp->next_tx_buffer;
+	buffer_offset = pp->tx_buffer_offset[current_tx_buffer];
+
+	x = 0;
+	/* Set the first byte of x (with lowest address) to x_char. */
+	*(uint8_t *)(&x) = x_char;
+
+	/* Copy x (4 bytes) to the beginning of the Tx buffer. */
+	p2puart_serial_out(port, buffer_offset, x);
+	port->icount.tx++;
+	port->x_char = 0;
+
+	mb();
+
+	/* Set packet size and Issue Tx_Start */
+	p2puart_issue_tx_start_command(port, current_tx_buffer, 1);
+
+	/* flip the next Tx buffer number */
+	pp->next_tx_buffer = !current_tx_buffer;
+}
+
+/**
+ * Copy characters from tty layer to device's Tx buffer.
+ * Copy as much characters as possible from the tty xmit buffer to the
+ * device's Tx buffer.
+ * Copied characters are removed from the tty buffer, and the port's tx
+ * count is incremented by the amount of bytes copied.
+ * @param port A pointer to the uart_port structure.
+ * @return The number of characters copied.
+ */
+static unsigned int
+p2puart_copy_chars_from_tty_to_tx_buffer(struct uart_port *port)
+{
+	struct p2puart_port *pp = to_p2puart_port(port);
+	struct circ_buf *xmit = &port->state->xmit;
+	unsigned int current_tx_buffer;
+	unsigned int buffer_offset;
+	unsigned int write_offset;
+	unsigned int tx_buffer_size;
+
+	current_tx_buffer = pp->next_tx_buffer;
+
+	buffer_offset = pp->tx_buffer_offset[current_tx_buffer];
+	tx_buffer_size = pp->tx_buffer_size;
+	/* Fill next tx buffer with the bytes to transmit. */
+
+	/* Notes:
+	Assuming byte enabled firmware.
+	Tx buffer cannot be read. */
+
+	write_offset = 0;
+	while (uart_circ_chars_pending(xmit) &&
+	       (write_offset < tx_buffer_size)) {
+		uint32_t i;
+		uint32_t remaining = tx_buffer_size - write_offset;
+		i = min(remaining, (uint32_t)uart_circ_chars_pending(xmit));
+		i = min(i, (uint32_t)CIRC_CNT_TO_END(xmit->head, xmit->tail,
+						     UART_XMIT_SIZE));
+		PRINT_TX_BUFFER(port, &xmit->buf[xmit->tail], i);
+		memcpy_toio(port->membase + buffer_offset + write_offset,&xmit->buf[xmit->tail], i);
+		xmit->tail = (xmit->tail + i) & (UART_XMIT_SIZE - 1);
+		write_offset += i;
+	}
+
+	port->icount.tx += write_offset;
+
+	return write_offset;
+}
+
+/**
+ * Handles Tx.
+ * Handles transmit requests.
+ * This function is called from p2puart_start_tx() and from
+ * p2puart_handle_irq().
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_handle_tx(struct uart_port *port)
+{
+	struct p2puart_port *pp = to_p2puart_port(port);
+	struct circ_buf *xmit = &port->state->xmit;
+	unsigned int current_tx_buffer;
+	unsigned int chars_to_copy;
+
+	PRINT_FUNCTION_ENTRY("p2puart_handle_tx");
+
+	if (unlikely(!pp->tx_channel_exists)) {
+		unsigned int chars_pending = uart_circ_chars_pending(xmit);
+
+		uart_circ_clear(xmit);
+		port->icount.tx += chars_pending;
+		return;
+	}
+
+	if (uart_tx_stopped(port))
+		return;
+
+	if (uart_circ_empty(xmit))
+		return;
+
+	current_tx_buffer = pp->next_tx_buffer;
+
+	/* High-priority char first */
+	if (port->x_char) {
+		p2puart_transmit_xchar(port, port->x_char);
+		return;
+	}
+
+	/*
+	 * If there is no free Tx buffer, we cannot transmit now.
+	 * start_tx is expected to be called later (after some sleep)
+	 * by serial_core's uart_wait_until_sent().
+	 */
+	if (p2puart_is_tx_buffer_busy(port, current_tx_buffer)) {
+		pr_debug("%s: TX buffer %u busy\n",
+			 pp->name, current_tx_buffer);
+		return;
+	}
+
+	/* Copy from TTY to DPR */
+	chars_to_copy = p2puart_copy_chars_from_tty_to_tx_buffer(port);
+	if (!chars_to_copy)
+		return;	/* nothing copied, don't arm TX */
+
+	mb();
+
+	/* Issue Tx_Start with handshake; respect result */
+	if (!p2puart_issue_tx_start_command(port,
+					    current_tx_buffer,
+					    chars_to_copy)) {
+		/*
+		 * HW refused the TX_START handshake.
+		 * We leave next_tx_buffer unchanged; upper layers
+		 * will re-enter handle_tx() after the next wakeup.
+		 * If this ever happens, you should see the dev_err()
+		 * from p2puart_issue_tx_start_command().
+		 */
+		return;
+	}
+
+	/* Optional: keep this only if you still need verbose logs */
+	/* uint32_t ipr_now = p2puart_serial_in(port, COMCTRL_IPR); */
+	/* pr_info("%s: IPR right after TX_START = 0x%08x\n", */
+	/*         pp->name, ipr_now); */
+
+	/* Flip to the other buffer for the next TX */
+	pp->next_tx_buffer = !current_tx_buffer;
+
+	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+		uart_write_wakeup(port);
+}
+
+
+
+/**
+ * Serial driver start_tx().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_start_tx(struct uart_port *port)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_start_tx");
+
+	if (uart_tx_stopped(port))
+		return;
+
+	if (uart_circ_empty(&port->state->xmit))
+		return;
+
+	p2puart_handle_tx(port);
+}
+
+/**
+ * Serial driver stop_rx().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_stop_rx(struct uart_port *port)
+{
+	struct p2puart_port *pp = to_p2puart_port(port);
+
+	PRINT_FUNCTION_ENTRY("p2puart_stop_rx");
+
+	pp->rx_enabled = false;
+}
+
+/**
+ * Serial driver break_ctl().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ * @param break_state The requested state of the break signal.
+ */
+static void p2puart_break_ctl(struct uart_port *port, int break_state)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_break_ctl");
+
+	/* TODO: check if p2puart supports this function. */
+}
+
+/**
+ * Returns which Rx buffers are active.
+ * Returns an enumeration that describes which Rx buffers are currently
+ * active. An active buffer is a buffer with the following bits set
+ * in its IPR registers:
+ * Rx_Packet_Size, Rx_Link_Done, Overrun, Window_Timeout_Error
+ * @param ipr The value read from the Interrupt Pending Register (IPR).
+ * @return RX_BUFFER_0 / RX_BUFFER_1 / RX_BUFFERS_0_AND_1.
+ */
+
+static unsigned int p2puart_get_active_rx_buffer(uint32_t ipr)
+{
+	bool buf0 = (ipr & (IPR_RX_PACKET_SIZE_DONE0 |
+			    IPR_RX_LINK_DONE0      |
+			    IPR_OVERRUN_ERROR0     |
+			    IPR_WINDOW_TIMEOUT_ERROR0)) != 0;
+
+	bool buf1 = (ipr & (IPR_RX_PACKET_SIZE_DONE1 |
+			    IPR_RX_LINK_DONE1      |
+			    IPR_OVERRUN_ERROR1     |
+			    IPR_WINDOW_TIMEOUT_ERROR1)) != 0;
+
+	if (buf0 && buf1)
+		return RX_BUFFERS_0_AND_1;
+	if (buf0)
+		return RX_BUFFER_0;
+	if (buf1)
+		return RX_BUFFER_1;
+
+	/* Should not happen if caller checked IPR_RX_MASK first */
+	return RX_BUFFER_0;
+}
+
+
+/**
+ * Acknowledge an Rx interrupt.
+ * Acknowledge an Rx interrupt by writing ones to the relevant bits in IPR.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ * @param ipr The value read from the Interrupt Pending Register (IPR).
+ */
+static void p2puart_acknowledge_rx_interrupt(struct uart_port *port,
+					     unsigned int buffer_number,
+					     uint32_t ipr)
+{
+	u32 mask = 0;
+
+	if (buffer_number == 0) {
+		if (ipr & IPR_RX_PACKET_SIZE_DONE0)
+			mask |= IPR_RX_PACKET_SIZE_DONE0;
+		if (ipr & IPR_RX_LINK_DONE0)
+			mask |= IPR_RX_LINK_DONE0;
+		if (ipr & IPR_OVERRUN_ERROR0)
+			mask |= IPR_OVERRUN_ERROR0;
+		if (ipr & IPR_WINDOW_TIMEOUT_ERROR0)
+			mask |= IPR_WINDOW_TIMEOUT_ERROR0;
+	} else {
+		if (ipr & IPR_RX_PACKET_SIZE_DONE1)
+			mask |= IPR_RX_PACKET_SIZE_DONE1;
+		if (ipr & IPR_RX_LINK_DONE1)
+			mask |= IPR_RX_LINK_DONE1;
+		if (ipr & IPR_OVERRUN_ERROR1)
+			mask |= IPR_OVERRUN_ERROR1;
+		if (ipr & IPR_WINDOW_TIMEOUT_ERROR1)
+			mask |= IPR_WINDOW_TIMEOUT_ERROR1;
+	}
+
+	if (mask)
+		p2puart_serial_out(port, COMCTRL_IPR, mask);
+}
+
+/**
+ * Returns the RxBuf_Last_Address field.
+ * Returns the RxBuf_Last_Address field from a raw value of an RxBuf_Ctrl
+ * register.
+ * @param rxbuf_ctrl The value read from a RxBuf_Ctrl register.
+ * @return The value of the RxBuf_Last_Address field in the register.
+ */
+static unsigned int p2puart_get_last_address(uint32_t rxbuf_ctrl)
+{
+	return ((rxbuf_ctrl & RXBUF_LAST_ADDRESS_MASK) >>
+		RXBUF_LAST_ADDRESS_SHIFT);
+}
+
+/**
+ * Reads an RxBuf_Ctrl register.
+ * Reads the value from an RxBuf_Ctrl register.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ * @return The value read from the corresponding RxBuf_Ctrl regsiter.
+ */
+static uint32_t p2puart_get_rxbuf_ctrl(struct uart_port *port,
+				       unsigned int buffer_number)
+{
+	unsigned int rxbuf_ctrl_address;
+	uint32_t rxbuf_ctrl;
+
+	PRINT_FUNCTION_ENTRY("p2puart_get_rxbuf_ctrl");
+
+	rxbuf_ctrl_address = ((buffer_number == 0) ? RXBUF0_CTRL : RXBUF1_CTRL);
+	rxbuf_ctrl = p2puart_serial_in(port, rxbuf_ctrl_address);
+	return rxbuf_ctrl;
+}
+
+#ifdef DEBUG_PRINT_RX_INTERRUPT
+/**
+ * Prints rx interrupt debug messages to kernel log.
+ * Prints debug messages about Rx interrupts to kernel log.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ * @param last_address The value read from the RxBuf_Last_Address field of
+ * the RxBuf_Ctrl register.
+ * @param ipr The value read from the Interrupt Pending Register (IPR).
+ * @param rxbuf_ctrl The value read from the RxBuf_Ctrl register.
+ */
+static void p2puart_debug_print_rx_interrupt(struct uart_port *port,
+					     unsigned int buffer_number,
+					     unsigned int last_address,
+					     uint32_t ipr, uint32_t rxbuf_ctrl)
+{
+	if (ipr & (buffer_number + 1)) {
+		printk("%s: Packet Size interrupt for buffer %d, "
+		       "last_address:%d ipr:0x%x rxbuf_ctrl:0x%x\n",
+		       port->name, buffer_number, last_address, ipr,
+		       rxbuf_ctrl);
+	} else if (ipr & ((buffer_number + 1) << 2)) {
+		printk("%s: Rx Link Done interrupt for buffer %d, "
+		       "last_address:%d ipr:0x%x rxbuf_ctrl:0x%x\n",
+		       port->name, buffer_number, last_address, ipr,
+		       rxbuf_ctrl);
+	}
+}
+#endif
+
+/**
+ * Returns the tty flag for the received buffer and update error counters.
+ * Returns the flag that needs to be passed to the tty layer, according to
+ * status bits in the RxBuf_Ctrl register, and update the port's error
+ * counters accordingly.
+ * @param port A pointer to the uart_port structure.
+ * @param rxbuf_ctrl The value read from the RxBuf_Ctrl register.
+ * @param status The error bits which are set in rxbuf_ctrl and not masked
+ * by read_status_mask.
+ * @return The value of the flag that needs to be passed to the tty layer.
+ */
+static char p2puart_get_rx_flag_and_update_error_counters(
+	struct uart_port *port, uint32_t rxbuf_ctrl, uint32_t status)
+{
+	char flag;
+
+	flag = TTY_NORMAL;
+
+	if (unlikely(status)) {
+		if (status & COMCTRL_RXBUF_OVERRUN_ERROR) {
+			flag = TTY_OVERRUN;
+			port->icount.overrun++;
+		} else if (status & P2PUART_PARITY_ERROR) {
+			flag = TTY_PARITY;
+			(port->icount.parity) +=
+				(p2puart_get_last_address(rxbuf_ctrl) + 1);
+		} else if (status & P2PUART_FRAME_ERROR) {
+			flag = TTY_FRAME;
+			(port->icount.frame) +=
+				(p2puart_get_last_address(rxbuf_ctrl) + 1);
+		}
+	}
+
+	return flag;
+}
+
+/**
+ * Copy received data from device to tty.
+ * Copy received data from a device's Rx buffer to tty layer.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ * @param last_address The value read from the RxBuf_Last_Address field of
+ * the RxBuf_Ctrl register.
+ * @param flag The flag that will be passed to the tty layer along with the
+ * received data. This flag marks possible error in the received data.
+ */
+static void p2puart_copy_rx_data_to_tty_buffer(struct uart_port *port,
+					       unsigned int buffer_number,
+					       unsigned int last_address,
+					       char flag)
+{
+	struct p2puart_port *pp;
+	unsigned int bytes_to_copy;
+	uint32_t src;
+
+	pp = to_p2puart_port(port);
+	bytes_to_copy = last_address + 1;
+	src = pp->rx_buffer_offset[buffer_number];
+
+	if (likely(flag == TTY_NORMAL)) {
+		/* Fast path. memcpy_fromio directly into tty buffer. */
+		unsigned char *chars;
+		int space;
+		/* Make sure tty has room; if not, throttle and DO NOT consume HW buffer */
+if (tty_buffer_request_room(&port->state->port, bytes_to_copy) < bytes_to_copy) {
+    u32 imr;
+
+    pp->throttle_state = true;
+
+    imr = p2puart_serial_in(port, COMCTRL_IMR);
+    imr |= IMR_RX_ALL_MASK;
+    p2puart_serial_out(port, COMCTRL_IMR, imr);
+    (void)p2puart_serial_in(port, COMCTRL_IMR);
+
+    return;
+}
+
+space = tty_prepare_flip_string(&port->state->port, &chars, bytes_to_copy);
+if (space < bytes_to_copy) {
+    /* Should not happen after request_room(), but be safe */
+    u32 imr;
+
+    pp->throttle_state = true;
+
+    imr = p2puart_serial_in(port, COMCTRL_IMR);
+    imr |= IMR_RX_ALL_MASK;
+    p2puart_serial_out(port, COMCTRL_IMR, imr);
+    (void)p2puart_serial_in(port, COMCTRL_IMR);
+
+    return;
+}
+
+memcpy_fromio(chars, port->membase + src, bytes_to_copy);
+
+		PRINT_RX_BUFFER(port, chars, bytes_to_copy);
+
+	} else {
+		/* Slow path. Use an intermediate temporary buffer. */
+		memcpy_fromio(pp->temp_rx_buffer, port->membase + src,
+			      bytes_to_copy);
+		PRINT_RX_BUFFER(port, pp->temp_rx_buffer, bytes_to_copy);
+if (tty_buffer_request_room(&port->state->port, bytes_to_copy) < bytes_to_copy) {
+    u32 imr;
+
+    pp->throttle_state = true;
+
+    imr = p2puart_serial_in(port, COMCTRL_IMR);
+    imr |= IMR_RX_ALL_MASK;
+    p2puart_serial_out(port, COMCTRL_IMR, imr);
+    (void)p2puart_serial_in(port, COMCTRL_IMR);
+
+    return;
+}
+
+tty_insert_flip_string_fixed_flag(&port->state->port,
+                                  pp->temp_rx_buffer, flag,
+                                  bytes_to_copy);
+
+	}
+
+	(port->icount.rx) += bytes_to_copy;
+
+	tty_flip_buffer_push(&port->state->port);
+}
+
+/**
+ * Copies received data to tty layer and updates error counters.
+ * Copies received data from a device's Rx buffer to tty later, and updates
+ * the port's error counters accordingly.
+ * Rx Link Done interrupts.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ * @param ipr The value read from the Interrupt Pending Register (IPR).
+ * @param rxbuf_ctrl The value read from the RxBuf_Ctrl register.
+ * @return false if a spurious Rx Link Done interrupt is detected;
+ * false otherwise.
+ */
+static void p2puart_read_from_buffer(struct uart_port *port,
+				     unsigned int buffer_number, uint32_t ipr,
+				     uint32_t rxbuf_ctrl)
+{
+	struct p2puart_port *pp;
+	uint32_t status;
+	char flag;
+
+	PRINT_FUNCTION_ENTRY("p2puart_read_from_buffer");
+
+	pp = to_p2puart_port(port);
+
+	status = rxbuf_ctrl & P2PUART_RXBUF_ALL_ERRORS_MASK;
+	status &= port->read_status_mask;
+
+	flag = p2puart_get_rx_flag_and_update_error_counters(port, rxbuf_ctrl,
+							     status);
+
+	if (unlikely(TTY_OVERRUN == flag)) {
+		tty_insert_flip_char(&port->state->port, 0, TTY_OVERRUN);
+		return;
+	}
+
+	if (likely(!(status & port->ignore_status_mask)) &&
+	    likely(pp->rx_enabled)) {
+		unsigned int last_address;
+
+		last_address = p2puart_get_last_address(rxbuf_ctrl);
+
+#ifdef DEBUG_PRINT_RX_INTERRUPT
+		p2puart_debug_print_rx_interrupt(port, buffer_number,
+						 last_address, ipr, rxbuf_ctrl);
+#endif
+
+		p2puart_copy_rx_data_to_tty_buffer(port, buffer_number,
+						   last_address, flag);
+	}
+
+	return;
+}
+
+/**
+ * Clears the Buffer_Done bit and error bits in RxBuf_Ctrl.
+ * Clears the Buffer_Done bit and all set error bits in an RxBuf_Ctrl
+ * register.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ * @param rxbuf_ctrl The value read from the RxBuf_Ctrl register.
+ */
+static void p2puart_clear_buffer_done_bit_and_errors(struct uart_port *port,
+						     unsigned int buffer_number,
+						     uint32_t rxbuf_ctrl_snapshot)
+{
+	u32 reg;
+	u32 clear_mask = 0;
+
+	/* Select RxBuf_Ctrl register for buffer 0/1 */
+	reg = (buffer_number == 0) ? RXBUF0_CTRL : RXBUF1_CTRL;
+
+	clear_mask |= (rxbuf_ctrl_snapshot & 0x000000FF);
+clear_mask |= (rxbuf_ctrl_snapshot & RXBUF_BUFFER_DONE_MASK);
+
+if (!clear_mask)
+    return;
+
+p2puart_serial_out(port, reg, clear_mask);
+(void)p2puart_serial_in(port, reg);
+		
+}
+
+// In mcu_p2puart.c, add these functions
+
+
+
+/**
+ * Reads the received data, acknowledges the interrupt and
+ * clears the Buffer_Done bit and error bits.
+ * Reads the received data from an Rx buffer and passes it to the
+ * tty layer, acknowledges the Rx interrupt and clears the Buffer_Done bit
+ * and error bits.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_number [0/1] The device's buffer number on which we want to
+ * work.
+ * @param ipr The value read from the Interrupt Pending Register (IPR).
+ */
+/**
+ * Reads the received data, clears Buffer_Done + errors, and then
+ * acknowledges the Rx interrupt.
+ *
+ * This matches the ComCtrl nominal receive flow:
+ *  1. Read IPR (already done in ISR)
+ *  2. Read RxBuf_Ctrl
+ *  3. Read data from buffer
+ *  4. Clear errors / Buffer_Done in RxBuf_Ctrl
+ *  5. Clear IPR bits for this buffer
+ */
+ 
+ 
+ 
+ 
+// NEW SIGNATURE: Must return the IPR bit of the buffer if cleared, or 0 if held.
+// [Assuming this is the body of the p2puart_rx_single_buffer function]
+/*
+ * Reads data, handles throttling, and calculates the correct ACK mask.
+ * FIXED: ACKs Link Done interrupts (essential for short packets and message tails).
+ */
+static uint32_t p2puart_rx_single_buffer(struct uart_port *port, 
+                                         unsigned int buffer_number, 
+                                         uint32_t ipr) 
+{
+    struct p2puart_port *pp = to_p2puart_port(port);
+    uint32_t rxbuf_ctrl_val, ack_mask = 0;
+    
+    /* If TTY asked us to throttle, do NOT touch the HW RX buffers.
+ * RX interrupts are masked in p2puart_throttle(); we will drain on unthrottle.
+ */
+if (pp->throttle_state)
+    return 0;
+
+    
+    // Mask for ALL valid RX bits (Packet Size + Link Done + Errors)
+    uint32_t this_buf_mask = (buffer_number == 0) ? IPR_RX0_MASK : IPR_RX1_MASK;
+
+    // 1. Snapshot the Control Register
+    rxbuf_ctrl_val = p2puart_serial_in(port, (buffer_number == 0) ? RXBUF0_CTRL : RXBUF1_CTRL);
+
+    // 2. Read the data into the TTY layer
+    p2puart_read_from_buffer(port, buffer_number, ipr, rxbuf_ctrl_val);
+    
+    if (pp->throttle_state) return 0; 
+    
+    // 3. Clear hardware Buffer Done & Errors
+    p2puart_clear_buffer_done_bit_and_errors(port, buffer_number, rxbuf_ctrl_val); 
+
+    // 4. FIX: Dynamic ACK based on what bit actually fired in IPR
+    ack_mask = ipr & this_buf_mask;
+    
+    return ack_mask;
+}
+
+// NOTE: If you cannot modify the body of p2puart_rx_single_buffer directly, 
+// you must wrap it in a function that implements this logic.
+
+
+/**
+ * Handles Rx interrupts.
+ * Handles Rx interrupts. Called from p2puart_handle_irq().
+ * @param port A pointer to the uart_port structure.
+ * @param ipr The value read from the Interrupt Pending Register (IPR).
+ */
+//static void p2puart_handle_rx(struct uart_port *port, uint32_t ipr)
+//{
+	/* Assume ipr contains the value read from IPR and that at least one
+	of the bits 0..5 in ipr is set.*/
+
+//	unsigned int active_rx_buffer;
+//	unsigned int buffer_number;
+//	struct p2puart_port *pp;
+
+//	PRINT_FUNCTION_ENTRY("p2puart_handle_rx");
+
+//	pp = to_p2puart_port(port);
+
+//	if (unlikely(!(pp->rx_channel_exists)))
+//		return;
+
+	/* Note: Overrun and Window Timeout error bits are not expected
+	to be set in IPR because they are masked (in IMR). */
+
+//	active_rx_buffer = p2puart_get_active_rx_buffer(ipr);
+
+	/* If only a single Rx buffer is active, use its number,
+	otherwise start with the least recently received buffer. */
+//	if (active_rx_buffer != RX_BUFFERS_0_AND_1)
+//		buffer_number = active_rx_buffer;
+//	else
+//		buffer_number = pp->next_rx_buffer;
+
+//	pp->next_rx_buffer = 1 - buffer_number;
+
+//	p2puart_rx_single_buffer(port, buffer_number, ipr);
+
+	/* If both buffers were active, handle the second buffer. */
+//	if (active_rx_buffer == RX_BUFFERS_0_AND_1)
+//		p2puart_rx_single_buffer(port, 1 - buffer_number, ipr);
+//		printk("Handling RX on buffer %d (active_rx_buffer=0x%x, next_rx_buffer=%d)\n",
+  //     buffer_number, active_rx_buffer, pp->next_rx_buffer);
+
+
+	//PRINT_FUNCTION_RETURN("p2puart_handle_rx");
+//}
+/**
+ * Handles Rx interrupts.
+ * Called from p2puart_handle_irq().
+ *
+ * ipr is the IPR snapshot taken in the ISR. At least one of bits 0..5
+ * is set (RX-related bits) when we get here.
+ *
+ * We support:
+ *  - Single-buffer events (only buffer 0 or only buffer 1 has RX bits)
+ *  - Combined events (both buffers have RX bits at once)
+ *
+ * In the combined case, we use IPR_LAST_BUFFER to preserve chronological
+ * order across the two buffers, as described in the ComCtrl manual
+ * for Combined mode and packets larger than a single buffer.
+ */
+// NEW SIGNATURE: returns uint32_t of the processed/cleared IPR bits
+// NEW SIGNATURE: returns uint32_t of the processed/cleared IPR bits
+static uint32_t p2puart_handle_rx(struct uart_port *port, uint32_t ipr)
+{
+    unsigned int active_rx_buffer;
+    unsigned int first_buf, second_buf;
+    struct p2puart_port *pp;
+    uint32_t processed_mask = 0; // New variable to track processed buffers
+
+    PRINT_FUNCTION_ENTRY("p2puart_handle_rx");
+
+    pp = to_p2puart_port(port);
+
+    if (unlikely(!pp->rx_channel_exists)) {
+        PRINT_FUNCTION_RETURN("p2puart_handle_rx (no rx_channel)");
+        return 0; // Must return 0 IPR mask
+    }
+
+    active_rx_buffer = p2puart_get_active_rx_buffer(ipr);
+
+    if (active_rx_buffer != RX_BUFFERS_0_AND_1) {
+        /* Single-buffer case */
+        first_buf  = active_rx_buffer;
+        second_buf = first_buf;          /* unused */
+
+        pp->next_rx_buffer = 1 - first_buf;
+
+        // Call the modified function and accumulate the mask
+        processed_mask |= p2puart_rx_single_buffer(port, first_buf, ipr); 
+    } else {
+        /* Combined / oversize-packet case, use LastBuffer to order */
+        bool last_is_buf1 = !!(ipr & IPR_LAST_BUFFER);
+
+        if (last_is_buf1) {
+            first_buf  = 0;
+            second_buf = 1;
+        } else {
+            first_buf  = 1;
+            second_buf = 0;
+        }
+
+        // Call the modified function and accumulate the mask
+        processed_mask |= p2puart_rx_single_buffer(port, first_buf, ipr);
+        processed_mask |= p2puart_rx_single_buffer(port, second_buf, ipr);
+
+        pp->next_rx_buffer = second_buf;
+    }
+
+    PRINT_FUNCTION_RETURN("p2puart_handle_rx");
+    return processed_mask; // Return the mask for IPR to clear
+}
+
+
+/**
+ * ISR.
+ * Interrupt Service Routine (ISR).
+ * This is the function that we register using devm_request_irq().
+ * @param irq Unused.
+ * @param dev_id A pointer to the uart_port structure.
+ * @return IRQ_NONE if the interrupt was not caused by the P2PUART device;
+ * IRQ_HANDLED otherwise.
+ */
+/*
+ * ISR.
+ * Interrupt Service Routine (ISR).
+ * This is the function that we register using devm_request_irq().
+ */
+#ifdef P2PUART_IS_EXTERNAL_PLATFORM_DEVICE
+static
+#endif
+irqreturn_t p2puart_handle_irq(int irq, void *dev_id)
+{
+    struct uart_port *port = dev_id;
+    struct p2puart_port *pp = to_p2puart_port(port);
+    uint32_t ipr;
+    uint32_t tx_ack_mask = 0;
+    uint32_t rx_ack_mask = 0; // Mask returned from RX handler
+    unsigned long flags;
+
+    spin_lock_irqsave(&port->lock, flags);
+
+    /* 1. Snapshot IPR once at IRQ entry */
+    ipr = p2puart_serial_in(port, COMCTRL_IPR);
+	
+	
+	
+	
+    if (!(ipr & IPR_ALL_MASK)) {
+        spin_unlock_irqrestore(&port->lock, flags);
+        return IRQ_NONE;
+    }
+    
+    // **CRITICAL: REMOVE THE PREMATURE ACK BLOCK HERE**
+    // Do NOT acknowledge the RX bits yet!
+
+    /* 2. TX side: Process and save ACK mask (TX can be Ack'd early) */
+    if (ipr & IPR_TX_MASK) {
+        if (ipr & IPR_TX_DONE0)
+            pp->tx_buffer_busy[0] = false;
+
+        if (ipr & IPR_TX_DONE1)
+            pp->tx_buffer_busy[1] = false;
+
+        tx_ack_mask = ipr & IPR_TX_MASK;
+        
+        p2puart_handle_tx(port);
+    }
+    
+    /* 3. RX side: Get back mask of successfully processed and CLEARED buffers */
+    if (ipr & IPR_RX_MASK) {
+        // CALL THE NEW FUNCTION SIGNATURE
+        rx_ack_mask = p2puart_handle_rx(port, ipr); 
+    }
+    
+    /* 4. Acknowledge Handled Interrupts (TX now, RX if it was processed) */
+    if (tx_ack_mask || rx_ack_mask) {
+        p2puart_serial_out(port, COMCTRL_IPR, tx_ack_mask | rx_ack_mask);
+        /* Flush the write to ensure HW sees it immediately */
+        (void)p2puart_serial_in(port, COMCTRL_IPR); 
+    }
+
+    spin_unlock_irqrestore(&port->lock, flags);
+
+    return IRQ_HANDLED;
+}
+
+
+#ifndef P2PUART_IS_EXTERNAL_PLATFORM_DEVICE
+EXPORT_SYMBOL(p2puart_handle_irq);
+#endif
+
+static void p2puart_throttle(struct uart_port *port)
+{
+    unsigned long flags;
+    u32 imr;
+    struct p2puart_port *pp = to_p2puart_port(port);
+
+    spin_lock_irqsave(&port->lock, flags);
+
+    /* 1. Set the throttle state */
+    pp->throttle_state = true;
+
+    /* 2. Mask (disable) the RX interrupts. */
+    imr = p2puart_serial_in(port, COMCTRL_IMR);
+    imr |= IMR_RX_ALL_MASK;
+    p2puart_serial_out(port, COMCTRL_IMR, imr);
+    (void)p2puart_serial_in(port, COMCTRL_IMR);
+
+
+    spin_unlock_irqrestore(&port->lock, flags);
+}
+
+
+static void p2puart_unthrottle(struct uart_port *port)
+{
+    unsigned long flags;
+    u32 imr;
+    struct p2puart_port *pp = to_p2puart_port(port);
+
+    spin_lock_irqsave(&port->lock, flags);
+
+    /* 1. Clear the throttle state */
+    pp->throttle_state = false;
+
+
+    
+    /* 3. Unmask (enable) RX interrupts */
+    imr = p2puart_serial_in(port, COMCTRL_IMR);
+    imr &= ~IMR_RX_ALL_MASK;
+    p2puart_serial_out(port, COMCTRL_IMR, imr);
+	(void)p2puart_serial_in(port, COMCTRL_IMR);
+
+    spin_unlock_irqrestore(&port->lock, flags);
+
+    /* 4. Reschedule the IRQ to immediately process any new or recently released data */
+    p2puart_handle_irq(port->irq, port); 
+}
+
+/**
+ * Updates the No Receive While Transmit bit in CPR.
+ * Updates the No Receive While Transmit bit in Channel Properties Register (CPR),
+ * according to the value of the no_receive_while_transmit field of struct p2puart_port.
+ * This bit can be set by users using the
+ * P2PUART_IOCTL_SET_NO_RECEIVE_WHILE_TRANSMIT ioctl.
+ * This function assumes that Reset_Rx and Reset_Tx are both high prior its
+ * invocation.
+ * @param port A pointer to the uart_port structure.
+ */
+void p2puart_update_no_receive_while_transmit(struct uart_port *port)
+{
+	uint32_t cpr;
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_update_no_receive_while_transmit");
+
+	pp = to_p2puart_port(port);
+
+	cpr = p2puart_serial_in(port, COMCTRL_CPR);
+
+	if (pp->no_receive_while_transmit)
+		cpr |= CPR_NO_RECEIVE_WHILE_TRANSMIT_MASK;
+	else
+		cpr &= ~CPR_NO_RECEIVE_WHILE_TRANSMIT_MASK;
+
+	p2puart_serial_out(port, COMCTRL_CPR, cpr);
+}
+
+#ifndef P2PUART_IS_EXTERNAL_PLATFORM_DEVICE
+static int p2puart_ioctl_set_no_receive_while_transmit(
+	struct uart_port *port, unsigned long no_receive_while_transmit);
+
+void p2puart_platform_update_no_receive_while_transmit(
+	struct platform_device *pdev, unsigned long no_receive_while_transmit)
+{
+	struct uart_port *up = platform_get_drvdata(pdev);
+	p2puart_ioctl_set_no_receive_while_transmit(up,
+						    no_receive_while_transmit);
+}
+
+EXPORT_SYMBOL(p2puart_platform_update_no_receive_while_transmit);
+#endif
+
+/**
+ * Gets the No Receive While Transmit bit from CPR.
+ * Gets the No Receive While Transmit bit in Channel Properties Register (CPR).
+ */
+bool p2puart_get_no_receive_while_transmit(struct uart_port *port)
+{
+	uint32_t cpr;
+	bool no_receive_while_transmit;
+
+	PRINT_FUNCTION_ENTRY("p2puart_get_no_receive_while_transmit");
+
+	cpr = p2puart_serial_in(port, COMCTRL_CPR);
+
+	no_receive_while_transmit =
+		((cpr & CPR_NO_RECEIVE_WHILE_TRANSMIT_MASK) ? true : false);
+
+	return no_receive_while_transmit;
+}
+
+/**
+ * Updates the streaming mode bit in CPR.
+ * Updates the streaming mode bit in Channel Properties Register (CPR),
+ * according to the value of the streaming field of struct p2puart_port.
+ * The streaming field can be set by users using the
+ * P2PUART_IOCTL_SET_STREAMING_MODE ioctl.
+ * This function assumes that Reset_Rx and Reset_Tx are both high prior its
+ * invocation.
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_update_streaming_mode_bit(struct uart_port *port)
+{
+	uint32_t cpr;
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_update_streaming_mode_bit");
+
+	pp = to_p2puart_port(port);
+
+	cpr = p2puart_serial_in(port, COMCTRL_CPR);
+
+	if (pp->streaming)
+		cpr |= CPR_STREAMING_MODE_ENABLE_MASK;
+	else
+		cpr &= ~CPR_STREAMING_MODE_ENABLE_MASK;
+
+	p2puart_serial_out(port, COMCTRL_CPR, cpr);
+}
+
+/**
+ * Sets the End_of_Packet_Condition_Trigger field in CPR.
+ * Sets the End_of_Packet_Condition_Trigger field in Channel Properties
+ * Register (CPR).
+ * This function assumes that Reset_Rx and Reset_Tx are both high prior its
+ * invocation.
+ * @param port A pointer to the uart_port structure.
+ * @param trigger The requested field value.
+ */
+static void p2puart_set_end_of_packet_condition_trigger(struct uart_port *port,
+							unsigned int trigger)
+{
+	uint32_t cpr;
+
+	PRINT_FUNCTION_ENTRY("p2puart_set_end_of_packet_condition_trigger");
+
+	cpr = p2puart_serial_in(port, COMCTRL_CPR);
+	cpr &= ~CPR_END_OF_PACKET_CONDITION_TRIGGER_MASK;
+	cpr |= ((trigger << CPR_END_OF_PACKET_CONDITION_TRIGGER_SHIFT) &
+		CPR_END_OF_PACKET_CONDITION_TRIGGER_MASK);
+	p2puart_serial_out(port, COMCTRL_CPR, cpr);
+}
+
+/**
+ * Sets the LoopBack field in CPR.
+ * Sets the LoopBack field in Channel Properties Register (CPR).
+ * This function assumes that Reset_Rx and Reset_Tx are both high prior its
+ * invocation.
+ * @param port A pointer to the uart_port structure.
+ * @param loopback The requested field value.
+ */
+static void p2puart_set_loopback_mode(struct uart_port *port,
+                                      unsigned int loopback)
+{
+    uint32_t cpr;
+
+	PRINT_FUNCTION_ENTRY("p2puart_set_loopback_mode");
+    cpr = p2puart_serial_in(port, COMCTRL_CPR);
+    // Clear existing loopback bits
+    cpr &= ~CPR_LOOPBACK_MASK;
+    // Insert the new loopback
+    cpr |= (loopback & CPR_LOOPBACK_MASK);
+
+    // Print debug
+    printk("%s: set_loopback_mode old_CPR=0x%08x new_CPR=0x%08x loop=%u\n",
+           to_p2puart_port(port)->name, 
+           (unsigned)cpr, (unsigned)(cpr & CPR_LOOPBACK_MASK), loopback);
+
+    p2puart_serial_out(port, COMCTRL_CPR, cpr);
+    
+    uint32_t check = p2puart_serial_in(port, COMCTRL_CPR);
+	printk("%s: post-write CPR=0x%08x\n", to_p2puart_port(port)->name, check);
+}
+
+/**
+ * Sets the Rx_Packet_Size field in CPR.
+ * Sets the Rx_Packet_Size field in Channel Properties Register (CPR).
+ * This function assumes that Reset_Rx and Reset_Tx are both high prior its
+ * invocation.
+ * @param port A pointer to the uart_port structure.
+ * @param rx_packet_size The value for the field, or 0 to use the value from
+ * the rx_buffer_size field from struct p2puart_port (meaning full buffer).
+ */
+static void p2puart_set_rx_packet_size(struct uart_port *port,
+				       unsigned int rx_packet_size)
+{
+	uint32_t cpr;
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_set_rx_packet_size");
+
+	pp = to_p2puart_port(port);
+	cpr = p2puart_serial_in(port, COMCTRL_CPR);
+	cpr &= ~CPR_RX_PACKET_SIZE_MASK;
+	cpr |= ((rx_packet_size << CPR_RX_PACKET_SIZE_SHIFT) &
+		CPR_RX_PACKET_SIZE_MASK);
+	p2puart_serial_out(port, COMCTRL_CPR, cpr);
+
+	/* If the caller passes rx_packet_size==0, we will use
+	pp->rx_buffer_size. */
+	pp->rx_packet_size =
+		(rx_packet_size ? rx_packet_size : pp->rx_buffer_size);
+}
+
+/**
+ * Masks all interrupts in IMR and also clears Tx Done bits in IPR
+ * (because they are not cleared by Soft Reset).
+ * Assumes to be called when Reset RX and Reset TX are asserted.
+ * (i.e. after calling p2puart_raise_reset_rx_and_tx).
+ */
+static void p2puart_mask_all_interrupts(struct uart_port *port)
+{
+	uint32_t ipr;
+
+	/* Mask all interrupts */
+	p2puart_serial_out(port, COMCTRL_IMR, IMR_ALL_MASK);
+
+	/* Notes: The receive parts of IPR and IMR are cleared by Soft Reset. */
+
+	/* Clear Tx done bits in IPR if they are set (they are not cleared by
+	 * Soft Reset)
+	 */
+	ipr = p2puart_serial_in(port, COMCTRL_IPR);
+	ipr &= (IPR_TX_DONE0 | IPR_TX_DONE1);
+	if (ipr)
+		p2puart_serial_out(port, COMCTRL_IPR, ipr);
+}
+
+
+/**
+ * Serial driver startup().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ * @return 0 upon success; Other values indicate an error.
+ */
+static int p2puart_startup(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+	unsigned long flags;
+	uint32_t imr;
+
+	pp = to_p2puart_port(port);
+
+	/* This print must be after we call snprintf into pp->name. */
+	PRINT_FUNCTION_ENTRY("p2puart_startup");
+
+	pp->wakeup_parity_mode = 0;
+
+	/* Request the firmware to reset the Rx and Tx channels */
+	p2puart_raise_reset_rx_and_tx(port);
+
+	p2puart_mask_all_interrupts(port);
+
+	p2puart_update_streaming_mode_bit(port);
+
+	p2puart_set_loopback_mode(port, pp->loopback);
+
+	p2puart_set_end_of_packet_condition_trigger(port, CPR_EOP_BOTH);
+
+	p2puart_update_scp(port);
+
+	p2puart_lower_reset_rx_and_tx(port);
+	
+	p2puart_unmask_all_interrupts(port); //added doron
+	
+	pp->tx_buffer_busy[0] = false;
+	pp->tx_buffer_busy[1] = false;
+
+	/* enable Tx and Rx interrupts */
+	spin_lock_irqsave(&port->lock, flags);
+	imr = IMR_ALL_MASK;
+
+	/* Enable link done interrupts */
+	imr &= ~(IPR_RX_LINK_DONE0 | IPR_RX_LINK_DONE1);
+
+	/* Enable Packet Size interrupts */
+	imr &= ~(IPR_RX_PACKET_SIZE_DONE0 | IPR_RX_PACKET_SIZE_DONE1);
+	
+	imr &= ~(IPR_OVERRUN_ERROR0 | IPR_OVERRUN_ERROR1); //doron addition
+	imr &= ~IPR_WINDOW_TIMEOUT_MASK;
+
+	
+	imr &= ~IMR_TX_MASK;
+	p2puart_serial_out(port, COMCTRL_IMR, imr);
+
+	pp->previous_packet_size_last_address[0] = pp->rx_buffer_size;
+	pp->previous_packet_size_last_address[1] = pp->rx_buffer_size;
+
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	PRINT_FUNCTION_RETURN("p2puart_startup");
+
+	return 0;
+}
+
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+/**
+ * Waits for pending transmits to end.
+ * Waits until the device finishes to transmit any pending character.
+ * This function is compiled only if DEBUG_WITH_UNITTEST_IOCTLS is defined.
+ * Note that the ComCtrl IP block has a bug which causes this function
+ * to return too early (before the last character is transmitted).
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_wait_for_pending_transmits_to_end(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_wait_for_pending_transmits_to_end");
+
+	pp = to_p2puart_port(port);
+
+	/* Wait for pending transmits to finish, if there is a pending
+	transmit. */
+	while (pp->tx_buffer_busy[0]) {
+		schedule();
+		mb();
+	}
+	mb();
+	while (pp->tx_buffer_busy[1]) {
+		schedule();
+		mb();
+	}
+	mb();
+	while (pp->tx_buffer_busy[0]) {
+		schedule();
+		mb();
+	}
+
+	PRINT_FUNCTION_RETURN("p2puart_wait_for_pending_transmits_to_end");
+}
+#endif /* DEBUG_WITH_UNITTEST_IOCTLS */
+
+/**
+ * Serial driver shutdown().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_shutdown(struct uart_port *port)
+{
+	unsigned long flags;
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_shutdown");
+
+	pp = to_p2puart_port(port);
+
+	/*
+	 * Disable interrupts from this port.
+	 * Note: We will wait here for port->lock to be free.
+	 * (e.g. if the ISR is active).
+	 */
+	spin_lock_irqsave(&port->lock, flags);
+
+	p2puart_raise_reset_rx_and_tx(port);
+	p2puart_mask_all_interrupts(port);
+
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	/* Wait for any ISR to finish */
+	synchronize_irq(port->irq);
+
+	if (pp->tx_buffer_busy[0] || pp->tx_buffer_busy[1])
+		printk("%s: WARNING: Tx buffer is busy in p2puart_shutdown"
+		       " end\n",
+		       to_p2puart_port(port)->name);
+
+	PRINT_FUNCTION_RETURN("p2puart_shutdown");
+}
+
+/**
+ * Updates the value of SCP.
+ * Updates the value of the Specific Capabilities Register (SCP) according
+ * to port settings (parity, wakeup_parity_mode, number_of_stop_bits,
+ * termination_enable, character_timeout_period).
+ * This function assumes that Reset_Rx and Reset_Tx are both high prior its
+ * invocation.
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_update_scp(struct uart_port *port)
+{
+	uint32_t scp;
+	struct p2puart_port *pp;
+	uint32_t cto;
+	unsigned int parity;
+	scp = 0;
+
+	PRINT_FUNCTION_ENTRY("p2puart_update_scp");
+
+	pp = to_p2puart_port(port);
+	parity = pp->parity;
+	if (pp->wakeup_parity_mode && parity == SCP_PARITY_MARK)
+		parity = SCP_PARITY_WAKEUP;
+
+#ifdef DEBUG_PRINT_PARITY
+	printk("%s: setting SCP parity to %u\n", pp->name, parity);
+#endif
+
+	/* Stop bits */
+	if (1 == pp->number_of_stop_bits)
+		scp |= SCP_1_STOP_BIT;
+	else if (2 == pp->number_of_stop_bits)
+		scp |= SCP_2_STOP_BITS;
+
+	/* Rx parity */
+	scp |= ((parity << SCP_RX_PARITY_SHIFT) & SCP_RX_PARITY_MASK);
+	/* Tx parity */
+	scp |= (parity & SCP_TX_PARITY_MASK);
+
+	/* Transceiver termination */
+	scp &= ~SCP_TRANSCEIVER_TERMINATION_MASK;
+	if (pp->termination_enable)
+		scp |= SCP_TRANSCEIVER_TERMINATION_MASK;
+
+	/* Character timeout period */
+	cto = p2puart_cto_physical_to_raw(pp->character_timeout_period);
+	scp |= ((cto << SCP_CHARACTER_TIMEOUT_PERIOD_SHIFT) &
+		SCP_CHARACTER_TIMEOUT_PERIOD_MASK);
+
+	p2puart_serial_out(port, P2P_SCP, scp);
+}
+
+/**
+ * Prints a warning message when baud rate error is too high.
+ * Prints a warning message to kernel log when the actual baud
+ * rate differs significally from the desired baud rate (by more
+ * than 3 percents).
+ * @param port A pointer to the uart_port structure.
+ * @param calculated_baud Actual baud rate.
+ * @param baud Desired baud rate.
+ */
+static void
+p2puart_warn_if_baud_rate_error_is_too_high(struct uart_port *port,
+					    unsigned long calculated_baud,
+					    unsigned long baud)
+{
+	struct p2puart_port *pp;
+	unsigned long baud_error;
+	unsigned long max_error;
+
+	PRINT_FUNCTION_ENTRY("p2puart_warn_if_baud_rate_error_is_too_high");
+
+	max_error = (baud * MAX_BAUD_RATE_ERROR_PERCENTS) / 100;
+
+	pp = to_p2puart_port(port);
+	if (baud < calculated_baud)
+		baud_error = calculated_baud - baud;
+	else
+		baud_error = baud - calculated_baud;
+
+	if (baud_error > max_error) {
+		printk("%s: WARNING: baud rate error is higher than %d"
+		       " percents. desired:%lu, actual:%lu,"
+		       " absolute_error:%lu.\n",
+		       pp->name, MAX_BAUD_RATE_ERROR_PERCENTS, baud,
+		       calculated_baud, baud_error);
+	}
+}
+
+/**
+ * Serial driver set_termios().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ * @param termios A pointer to the ktermios structure.
+ * @param old A pointer to the old ktermios structure.
+ */
+ #if 0
+static void p2puart_set_termios(struct uart_port *port,
+				struct ktermios *termios,
+				const struct ktermios *old)
+#if 0
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+				const struct ktermios *old
+#else
+				struct ktermios *old
+#endif
+)
+#endif
+#endif
+
+// RHEL specific changes
+#if defined(RHEL_RELEASE_CODE) && defined(RHEL_RELEASE_VERSION)
+#if RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,2)
+static void p2puart_set_termios(struct uart_port *port,
+				 struct ktermios *termios,
+				 const struct ktermios *old)
+#endif // RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9,2)
+#else //  defined(RHEL_RELEASE_CODE) && defined(RHEL_RELEASE_VERSION)
+static void p2puart_set_termios(struct uart_port *port,
+				 struct ktermios *termios,
+				 struct ktermios *old)
+#endif // defined(RHEL_RELEASE_CODE) && defined(RHEL_RELEASE_VERSION)
+
+{
+	unsigned long baud;
+	unsigned long min_baud;
+	unsigned long max_baud;
+	unsigned long uartclk;
+	unsigned long calculated_baud;
+	uint16_t baud_n;
+	uint16_t baud_d;
+	uint32_t brr; /* Baud Rate Register */
+	uint32_t imr; /* Interrupt Mask Register */
+	unsigned long flags;
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_set_termios");
+
+	pp = to_p2puart_port(port);
+	uartclk = port->uartclk;
+	min_baud = 0;
+	max_baud = pp->maximum_baud_rate_khz * 1000000; //temp multi by mega
+	printk("MAX BAUD IN FUNCTION: %ld",max_baud);
+	/* Get the baud rate from serial_core. */
+	baud = uart_get_baud_rate(port, termios, old, min_baud, max_baud);
+
+	/* Calculate baud_n and baud_d values */
+	calculated_baud =
+		p2puart_calc_baud_divs(uartclk, baud, &baud_n, &baud_d);
+	if (0 == calculated_baud)
+		printk("%s: ERROR: %lu is not a valid baud rate"
+		       " for this firmware\n",
+		       pp->name, baud);
+
+//#ifdef DEBUG_PRINT_BAUD_RATE_CALCS
+	printk("**********************************************%s: clk:%u baud:%lu calculated_baud:%lu baud_n:%d baud_d:%d"
+	       " max:%lu\n",
+	       pp->name, port->uartclk, baud, calculated_baud, (int)baud_n,
+	       (int)baud_d, max_baud);
+//#endif
+
+	if (calculated_baud != baud)
+		p2puart_warn_if_baud_rate_error_is_too_high(
+			port, calculated_baud, baud);
+
+	/* Construct the value for the Baud Rate Register */
+	brr = 0;
+	brr |= (((uint32_t)baud_n << BAUD_RATE_N_SHIFT) & BAUD_RATE_N_MASK);
+	brr |= ((uint32_t)baud_d & BAUD_RATE_D_MASK);
+
+	spin_lock_irqsave(&port->lock, flags);
+
+	pp->requested_baud_rate = baud;
+	pp->calculated_baud_rate = calculated_baud;
+	uart_update_timeout(port, termios->c_cflag, calculated_baud);
+
+	/* Save IMR value because the receive part of it will be cleared by
+	Sort Reset. */
+	imr = p2puart_serial_in(port, COMCTRL_IMR);
+
+	/* Assert reset to the Tx and Rx channels via the soft reset
+	register. Required by P2P UART in order to change the baud rate. */
+	/* TODO: what happens if UART is busy transmitting/receiving? */
+	p2puart_raise_reset_rx_and_tx(port);
+
+	/* Write the value to the Baud Rate Register */
+	p2puart_serial_out(port, P2P_BAUD_RATE, brr);
+
+	/* Warn if requested number of data bits is not 8. */
+	if ((termios->c_cflag & CSIZE) != CS8)
+		printk("%s: WARNING: requested number data bits is not 8\n",
+		       pp->name);
+
+	/* Set number of stop bits */
+	if (termios->c_cflag & CSTOPB)
+		pp->number_of_stop_bits = 2;
+	else
+		pp->number_of_stop_bits = 1;
+
+	/* Set parity */
+	if (termios->c_cflag & PARENB) {
+		/* Mark or Space parity */
+		if (termios->c_cflag & CMSPAR) {
+			if (termios->c_cflag & PARODD)
+				pp->parity = SCP_PARITY_MARK;
+			else
+				pp->parity = SCP_PARITY_SPACE;
+		} else {
+			if (termios->c_cflag & PARODD)
+				pp->parity = SCP_PARITY_ODD;
+			else
+				pp->parity = SCP_PARITY_EVEN;
+		}
+	} else {
+		pp->parity = SCP_PARITY_NONE;
+	}
+
+	/* characters to ignore */
+	port->ignore_status_mask = 0;
+
+	/*
+	* TODO: port->read_status_mask and port->ignore_status_mask
+	* need to be initialized based on termios settings for
+	* INPCK, IGNBRK, IGNPAR, PARMRK, BRKINT
+	* Currently we handle only INPCK and IGNPAR.
+	*/
+
+	port->read_status_mask = COMCTRL_RXBUF_OVERRUN_ERROR;
+
+	/* INPCK - enable frame and parity error events to be
+	passed to the TTY layer.
+	If INPCK==0, parity errors will be silently ignored
+	(corrupt data might be received). */
+	if (termios->c_iflag & INPCK)
+		port->read_status_mask |=
+			P2PUART_PARITY_ERROR | P2PUART_FRAME_ERROR;
+
+	/* IGNPAR - discard data with parity or framing errors,
+	if INPCK==1 and corrupted data is received.
+	Note: if INPCK==0, this flag has no effect.
+	When INPCK==1 and IGNPAR==1, characters with parity error
+	will be discarded.
+	For more information, refer to Documentation/serial/driver */
+	if (termios->c_iflag & IGNPAR)
+		port->ignore_status_mask |=
+			P2PUART_PARITY_ERROR | P2PUART_FRAME_ERROR;
+
+	if ((termios->c_cflag & CREAD) == 0)
+		pp->rx_enabled = false;
+	else
+		pp->rx_enabled = true;
+
+	p2puart_update_scp(port);
+
+	pp->tx_buffer_busy[0] = false;
+	pp->tx_buffer_busy[1] = false;
+
+	/* Deassert reset */
+	p2puart_lower_reset_rx_and_tx(port);
+
+	/* Restore saved IMR value. */
+	p2puart_serial_out(port, COMCTRL_IMR, imr);
+
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	/* Don't rewrite B0 */
+	if (tty_termios_baud_rate(termios))
+		tty_termios_encode_baud_rate(termios, calculated_baud,
+					     calculated_baud);
+
+	PRINT_FUNCTION_RETURN("p2puart_set_termios");
+}
+
+/**
+ * Serial driver type().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ * @return The string "16550A".
+ */
+static const char *p2puart_type(struct uart_port *port)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_type");
+
+	return P2PUART_PORT_TYPE_STRING;
+}
+
+/**
+ * Serial driver release_port().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_release_port(struct uart_port *port)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_release_port");
+
+	/* nothing to do */
+}
+
+/**
+ * Serial driver request_port().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ * @return 0.
+ */
+static int p2puart_request_port(struct uart_port *port)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_request_port");
+
+	return 0;
+}
+
+/**
+ * Serial driver config_port().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * This function responses only to UART_CONFIG_TYPE configuration
+ * type.
+ * @param port A pointer to the uart_port structure.
+ * @param flags A bit mask of the required configuration.
+ */
+static void p2puart_config_port(struct uart_port *port, int flags)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_config_port");
+
+	if (flags & UART_CONFIG_TYPE)
+		port->type = P2PUART_LINUX_PORT_TYPE;
+}
+
+/**
+ * Serial driver verify_port().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ */
+static int p2puart_verify_port(struct uart_port *port,
+			       struct serial_struct *ser)
+{
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_verify_port");
+
+	pp = to_p2puart_port(port);
+	if (ser->type != P2PUART_LINUX_PORT_TYPE) {
+		printk("%s: ERROR: port type is incorrect\n", pp->name);
+		return -EINVAL;
+	}
+	if (port->irq != ser->irq) {
+		printk("%s: ERROR: irq is incorrect\n", pp->name);
+		return -EINVAL;
+	}
+	if (port->iotype != ser->io_type) {
+		printk("%s: ERROR: iotype is incorrect\n", pp->name);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_SET_LOOPBACK_MODE.
+ * Handler for the P2PUART_IOCTL_SET_LOOPBACK_MODE ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @param loopback Value of the loopback parameter.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_ioctl_set_loopback_mode(struct uart_port *port,
+					   unsigned long loopback)
+{
+	struct p2puart_port *pp;
+	uint32_t imr;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_set_loopback_mode");
+
+	pp = to_p2puart_port(port);
+	if ((loopback != LOOPBACK_NONE) && (loopback != LOOPBACK_COMCTRL) &&
+	    (loopback != LOOPBACK_ENDPOINT) && (loopback != LOOPBACK_EXTERNAL))
+		return -EINVAL;
+
+	spin_lock_irqsave(&port->lock, flags);
+	pp->loopback = loopback;
+
+	/* Save IMR value because the receive part of iSCPt will be cleared by
+	Sort Reset. */
+	imr = p2puart_serial_in(port, COMCTRL_IMR);
+	p2puart_raise_reset_rx_and_tx(port);
+	p2puart_set_loopback_mode(port, loopback);
+	p2puart_lower_reset_rx_and_tx(port);
+	p2puart_serial_out(port, COMCTRL_IMR, imr);
+	spin_unlock_irqrestore(&port->lock, flags);
+	return 0;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_GET_LOOPBACK_MODE.
+ * Handler for the P2PUART_IOCTL_GET_LOOPBACK_MODE ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return The current loopback mode (loopback field in struct p2puart_port).
+ */
+static int p2puart_ioctl_get_loopback_mode(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+	int loopback;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_loopback_mode");
+
+	pp = to_p2puart_port(port);
+	spin_lock_irqsave(&port->lock, flags);
+	loopback = pp->loopback;
+	spin_unlock_irqrestore(&port->lock, flags);
+	return loopback;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_SET_STREAMING_MODE.
+ * Handler for the P2PUART_IOCTL_SET_STREAMING_MODE ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @param streaming Value of the streaming parameter.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_ioctl_set_streaming_mode(struct uart_port *port,
+					    unsigned long streaming)
+{
+	struct p2puart_port *pp;
+	uint32_t imr;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_set_streaming_mode");
+
+	pp = to_p2puart_port(port);
+	if (streaming > 1)
+		return -EINVAL;
+
+	spin_lock_irqsave(&port->lock, flags);
+	pp->streaming = (streaming ? true : false);
+
+	/* Save IMR value because the receive part of it will be cleared by
+	Sort Reset. */
+	imr = p2puart_serial_in(port, COMCTRL_IMR);
+	p2puart_raise_reset_rx_and_tx(port);
+	p2puart_update_streaming_mode_bit(port);
+	p2puart_lower_reset_rx_and_tx(port);
+	p2puart_serial_out(port, COMCTRL_IMR, imr);
+	spin_unlock_irqrestore(&port->lock, flags);
+	return 0;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_GET_NO_RECEIVE_WHILE_TRANSMIT
+ * Handler for the P2PUART_IOCTL_GET_NO_RECEIVE_WHILE_TRANSMIT ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return The current No Receive While Transmit mode
+ * (no_receive_while_transmit field in struct p2puart_port).
+ */
+static int p2puart_ioctl_get_no_receive_while_transmit(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+	int no_receive_while_transmit;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_no_receive_while_transmit");
+
+	pp = to_p2puart_port(port);
+	spin_lock_irqsave(&port->lock, flags);
+	no_receive_while_transmit =
+		(pp->no_receive_while_transmit ? true : false);
+	spin_unlock_irqrestore(&port->lock, flags);
+	return no_receive_while_transmit;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_SET_NO_RECEIVE_WHILE_TRANSMIT.
+ * Handler for the P2PUART_IOCTL_SET_NO_RECEIVE_WHILE_TRANSMIT ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @param no_receive_while_transmit Value of the no_receive_while_transmit parameter.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_ioctl_set_no_receive_while_transmit(
+	struct uart_port *port, unsigned long no_receive_while_transmit)
+{
+	struct p2puart_port *pp;
+	uint32_t imr;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_set_no_receive_while_transmit");
+
+	pp = to_p2puart_port(port);
+	if (no_receive_while_transmit > 1)
+		return -EINVAL;
+
+	spin_lock_irqsave(&port->lock, flags);
+	pp->no_receive_while_transmit =
+		(no_receive_while_transmit ? true : false);
+
+	/* Save IMR value because the receive part of it will be cleared by
+	Sort Reset. */
+	imr = p2puart_serial_in(port, COMCTRL_IMR);
+	p2puart_raise_reset_rx_and_tx(port);
+	p2puart_update_no_receive_while_transmit(port);
+	p2puart_lower_reset_rx_and_tx(port);
+	p2puart_serial_out(port, COMCTRL_IMR, imr);
+	spin_unlock_irqrestore(&port->lock, flags);
+	return 0;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_GET_STREAMING_MODE.
+ * Handler for the P2PUART_IOCTL_GET_STREAMING_MODE ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return The current streaming mode (streaming field in struct
+ * p2puart_port).
+ */
+static int p2puart_ioctl_get_streaming_mode(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+	int streaming;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_streaming_mode");
+
+	pp = to_p2puart_port(port);
+	spin_lock_irqsave(&port->lock, flags);
+	streaming = (pp->streaming ? 1 : 0);
+	spin_unlock_irqrestore(&port->lock, flags);
+	return streaming;
+}
+
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+/**
+ * Handler for P2PUART_IOCTL_UNITTEST_BENCHMARK_TXBUF_WRITE.
+ * Handler for the P2PUART_IOCTL_UNITTEST_BENCHMARK_TXBUF_WRITE ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_ioctl_unittest_benchmark_txbuf_write(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+	unsigned int buffer_size;
+	struct timespec ts_start;
+	struct timespec ts_end;
+	struct timespec ts_diff;
+	unsigned long diff_ns;
+	uint32_t *buf;
+	unsigned int buffer_offset;
+	struct platform_device *pdev = to_platform_device(port->dev);
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_unittest_benchmark_txbuf_write");
+
+	pp = to_p2puart_port(port);
+
+	buffer_offset = pp->tx_buffer_offset[0];
+	buffer_size = pp->tx_buffer_size;
+	buf = devm_kzalloc(&pdev->dev, buffer_size, GFP_KERNEL);
+
+	getnstimeofday(&ts_start);
+	memcpy_toio(port->membase + buffer_offset, buf, buffer_size);
+	getnstimeofday(&ts_end);
+	ts_diff = timespec_sub(ts_end, ts_start);
+	diff_ns = (ts_diff.tv_sec * 1000000000) + ts_diff.tv_nsec;
+	printk("%s: Time taken to write %d bytes to TXBUF0: "
+	       "%lu nanoseconds\n",
+	       pp->name, buffer_size, diff_ns);
+
+	devm_kfree(&pdev->dev, buf);
+	return 0;
+}
+#endif /* DEBUG_WITH_UNITTEST_IOCTLS */
+
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+/**
+ * Handler for P2PUART_IOCTL_UNITTEST_BENCHMARK_RXBUF_READ.
+ * Handler for the P2PUART_IOCTL_UNITTEST_BENCHMARK_RXBUF_READ ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_ioctl_unittest_benchmark_rxbuf_read(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+	struct timespec ts_start;
+	struct timespec ts_end;
+	struct timespec ts_diff;
+	unsigned long diff_ns;
+	char *buf;
+	uint32_t src;
+	struct platform_device *pdev = to_platform_device(port->dev);
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_unittest_benchmark_rxbuf_read");
+
+	pp = to_p2puart_port(port);
+
+	buf = devm_kzalloc(&pdev->dev, pp->rx_buffer_size, GFP_KERNEL);
+	if (!buf) {
+		printk("%s: memory allocation error\n", pp->name);
+		return 1;
+	}
+
+	src = pp->rx_buffer_offset[0];
+	getnstimeofday(&ts_start);
+	mb();
+	memcpy_fromio(buf, port->membase + src, pp->rx_buffer_size);
+	mb();
+	getnstimeofday(&ts_end);
+	ts_diff = timespec_sub(ts_end, ts_start);
+	diff_ns = (ts_diff.tv_sec * 1000000000) + ts_diff.tv_nsec;
+	printk("%s: Time taken to read %d bytes from RXBUF0: "
+	       "%lu nanoseconds\n",
+	       pp->name, pp->rx_buffer_size, diff_ns);
+
+	devm_kfree(&pdev->dev, buf);
+	return 0;
+}
+#endif /* DEBUG_WITH_UNITTEST_IOCTLS */
+
+/**
+ * Handler for P2PUART_IOCTL_GET_TERMINATION_CAPABILITY.
+ * Handler for the P2PUART_IOCTL_GET_TERMINATION_CAPABILITY ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return 0 for none; 1 for constant termination; 2 for controllable
+ * termination.
+ */
+static int p2puart_ioctl_get_termination_capability(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_termination_capability");
+
+	pp = to_p2puart_port(port);
+
+	return pp->transceiver_termination_capability;
+}
+
+/**
+ * Returns whether or not termination is controllable.
+ * Returns whether the device has controllable termination capability or not.
+ * @param port A pointer to the uart_port structure.
+ * @return true If termination is controllable; false otherwise.
+ */
+static bool p2puart_is_termination_controllable(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_is_termination_controllable");
+
+	pp = to_p2puart_port(port);
+	return (2 == pp->transceiver_termination_capability);
+}
+
+/**
+ * Handler for P2PUART_IOCTL_SET_TERMINATION.
+ * Handler for the P2PUART_IOCTL_SET_TERMINATION ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @param termination [0/1] Desired termination (0=off; 1=on).
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_ioctl_set_termination(struct uart_port *port,
+					 unsigned long termination)
+{
+	struct p2puart_port *pp;
+	uint32_t imr;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_set_termination");
+
+	pp = to_p2puart_port(port);
+	if (termination > 1)
+		return -EINVAL;
+
+	if (!p2puart_is_termination_controllable(port))
+		return -ENOTSUPP;
+
+	spin_lock_irqsave(&port->lock, flags);
+	pp->termination_enable = termination;
+
+	/* Save IMR value because the receive part of it will be cleared by
+	Sort Reset. */
+	imr = p2puart_serial_in(port, COMCTRL_IMR);
+	p2puart_raise_reset_rx_and_tx(port);
+	p2puart_update_scp(port);
+	p2puart_lower_reset_rx_and_tx(port);
+	p2puart_serial_out(port, COMCTRL_IMR, imr);
+	spin_unlock_irqrestore(&port->lock, flags);
+	return 0;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_GET_TERMINATION.
+ * Handler for the P2PUART_IOCTL_GET_TERMINATION ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return [0/1]. The current termination state from the firmware (from the
+ * SCP register). 0=off; 1=on.
+ */
+static int p2puart_ioctl_get_termination(struct uart_port *port)
+{
+	uint32_t scp;
+	int termination_enable;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_termination");
+
+	/* Get the termination state from the firmware.
+	 * We don't return the cached value from the uart struct,
+	 * because we won't be able to validate firmware behavior.
+	 */
+	spin_lock_irqsave(&port->lock, flags);
+	scp = p2puart_serial_in(port, P2P_SCP);
+	termination_enable = ((scp & SCP_TRANSCEIVER_TERMINATION_MASK) ? 1 : 0);
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	return termination_enable;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_GET_DUPLEX_CAPABILITY.
+ * Handler for the P2PUART_IOCTL_GET_DUPLEX_CAPABILITY ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return 0 for Half duplex; 1 for Full Duplex; 2 for controllable duplex.
+ */
+static int p2puart_ioctl_get_duplex_capability(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_duplex_capability");
+
+	pp = to_p2puart_port(port);
+
+	return pp->full_half_duplex_capability;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_GET_TRANSMIT_CAPABILITY.
+ * Handler for the P2PUART_IOCTL_GET_TRANSMIT_CAPABILITY ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return 1 if transmit capability exists; 0 otherwise.
+ */
+static int p2puart_ioctl_get_transmit_capability(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_transmit_capability");
+
+	pp = to_p2puart_port(port);
+
+	return pp->tx_channel_exists;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_GET_RECEIVE_CAPABILITY.
+ * Handler for the P2PUART_IOCTL_GET_RECEIVE_CAPABILITY ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return 1 if receive capability exists; 0 otherwise.
+ */
+static int p2puart_ioctl_get_receive_capability(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_receive_capability");
+
+	pp = to_p2puart_port(port);
+
+	return pp->rx_channel_exists;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_SET_CHARACTER_TIMEOUT_PERIOD.
+ * Handler for the P2PUART_IOCTL_SET_CHARACTER_TIMEOUT_PERIOD ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @param cto [1-256] Desired character timeout period, in character time
+ * units.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_ioctl_set_character_timeout_period(struct uart_port *port,
+						      unsigned long cto)
+{
+	struct p2puart_port *pp;
+	uint32_t imr;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_set_character_timeout_period");
+
+	pp = to_p2puart_port(port);
+	if ((0 == cto) || (cto > 256))
+		return -EINVAL;
+
+	spin_lock_irqsave(&port->lock, flags);
+	pp->character_timeout_period = cto;
+
+	/* Save IMR value because the receive part of it will be cleared by
+	Sort Reset. */
+	imr = p2puart_serial_in(port, COMCTRL_IMR);
+	p2puart_raise_reset_rx_and_tx(port);
+	p2puart_update_scp(port);
+	p2puart_lower_reset_rx_and_tx(port);
+	p2puart_serial_out(port, COMCTRL_IMR, imr);
+	spin_unlock_irqrestore(&port->lock, flags);
+	return 0;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_GET_CHARACTER_TIMEOUT_PERIOD.
+ * Handler for the P2PUART_IOCTL_GET_CHARACTER_TIMEOUT_PERIOD ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return [1-256]. The current character timeout period, in character time
+ * units. This value is a physical representation of the Character timeout
+ * Period field of the Specific Channel Properties (SCP) register.
+ */
+static int p2puart_ioctl_get_character_timeout_period(struct uart_port *port)
+{
+	unsigned int character_timeout;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_character_timeout_period");
+
+	spin_lock_irqsave(&port->lock, flags);
+	character_timeout = p2puart_get_character_timeout_period(port);
+	spin_unlock_irqrestore(&port->lock, flags);
+	return character_timeout;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_SET_WAKEUP_PARITY_MODE.
+ * Handler for the P2PUART_IOCTL_SET_WAKEUP_PARITY_MODE ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @param mode [0/1] If 1, parity setting of 3 (Mark) will be treated as
+ * wakeup parity.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_ioctl_set_wakeup_parity_mode(struct uart_port *port,
+						unsigned long mode)
+{
+	struct p2puart_port *pp;
+	uint32_t imr;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_set_wakeup_parity_mode");
+
+	pp = to_p2puart_port(port);
+	if (mode > 1)
+		return -EINVAL;
+
+	if (mode == pp->wakeup_parity_mode)
+		return 0; /* Success (nothing to do). */
+
+	pp->wakeup_parity_mode = mode;
+
+	spin_lock_irqsave(&port->lock, flags);
+
+	/* Save IMR value because the receive part of it will be cleared by
+	Sort Reset. */
+	imr = p2puart_serial_in(port, COMCTRL_IMR);
+	p2puart_raise_reset_rx_and_tx(port);
+	p2puart_update_scp(port);
+	p2puart_lower_reset_rx_and_tx(port);
+	p2puart_serial_out(port, COMCTRL_IMR, imr);
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	return 0;
+}
+
+/**
+ * Handler for P2PUART_IOCTL_GET_WAKEUP_PARITY_MODE.
+ * Handler for the P2PUART_IOCTL_GET_WAKEUP_PARITY_MODE ioctl.
+ * @param port A pointer to the uart_port structure.
+ * @return [0/1]. 0 if wakeup parity mode is disabled. 1 if it is enabled.
+ * Note that when wakeup parity mode is enabled, the device will be
+ * configured to wakeup parity only if the port parity setting is set to
+ * Mark.
+ */
+static int p2puart_ioctl_get_wakeup_parity_mode(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_get_wakeup_parity_mode");
+
+	pp = to_p2puart_port(port);
+	return pp->wakeup_parity_mode;
+}
+
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+/**
+ * Transmits a full Tx buffer.
+ * A unittest function that transmits a full Tx buffer and waits until
+ * transmit ends.
+ * Note that a ComCtrl IP block bug may cause this function to return before
+ * transmission ends.
+ * @param port A pointer to the uart_port structure.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int
+p2puart_ioctl_unittest_transmit_full_tx_buffer(struct uart_port *port)
+{
+	int bytes_to_transmit;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl_unittest_transmit_full_tx_buffer");
+
+	bytes_to_transmit = to_p2puart_port(port)->tx_buffer_size;
+	p2puart_issue_tx_start_command(port, 0, bytes_to_transmit);
+	uint32_t ipr_now = p2puart_serial_in(port, COMCTRL_IPR);
+//pr_info("%s: IPR right after TX_START = 0x%08x\n", pp->name, ipr_now);
+	p2puart_wait_for_pending_transmits_to_end(port);
+	return 0;
+}
+#endif
+
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+/**
+ * Transmits two full Tx buffers.
+ * A unittest function that transmits two full Tx buffers and waits until
+ * transmit ends.
+ * Note that a ComCtrl IP block bug may cause this function to return before
+ * transmission ends.
+ * @param port A pointer to the uart_port structure.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int
+p2puart_ioctl_unittest_transmit_two_full_tx_buffers(struct uart_port *port)
+{
+	int bytes_to_transmit;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY(
+		"p2puart_ioctl_unittest_transmit_two_full_tx_buffers");
+
+	bytes_to_transmit = to_p2puart_port(port)->tx_buffer_size;
+	spin_lock_irqsave(&port->lock, flags);
+	p2puart_issue_tx_start_command(port, 0, bytes_to_transmit);
+	p2puart_issue_tx_start_command(port, 1, bytes_to_transmit);
+	spin_unlock_irqrestore(&port->lock, flags);
+
+	p2puart_wait_for_pending_transmits_to_end(port);
+	return 0;
+}
+#endif
+
+/**
+ * Serial driver ioctl().
+ * Refer to kernel documentation (Documentation/serial/driver).
+ * @param port A pointer to the uart_port structure.
+ * @param cmd The ioctl command code.
+ * @param arg An optional argument of the ioctl.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_ioctl(struct uart_port *port, unsigned int cmd,
+			 unsigned long arg)
+{
+	int err = -ENOIOCTLCMD;
+	uint32_t param_value;
+	struct p2puart_port *pp;
+
+	PRINT_FUNCTION_ENTRY("p2puart_ioctl");
+
+	pp = to_p2puart_port(port);
+
+	switch (cmd) {
+	case P2PUART_IOCTL_SET_LOOPBACK_MODE:
+		if (get_user(param_value, (uint32_t __user *)arg))
+			return -EFAULT;
+		err = p2puart_ioctl_set_loopback_mode(port, param_value);
+		break;
+	case P2PUART_IOCTL_GET_LOOPBACK_MODE:
+		err = p2puart_ioctl_get_loopback_mode(port);
+		break;
+	case P2PUART_IOCTL_SET_STREAMING_MODE:
+		if (get_user(param_value, (uint32_t __user *)arg))
+			return -EFAULT;
+		err = p2puart_ioctl_set_streaming_mode(port, param_value);
+		break;
+	case P2PUART_IOCTL_GET_STREAMING_MODE:
+		err = p2puart_ioctl_get_streaming_mode(port);
+		break;
+	case P2PUART_IOCTL_SET_NO_RECEIVE_WHILE_TRANSMIT:
+		if (get_user(param_value, (uint32_t __user *)arg))
+			return -EFAULT;
+		err = p2puart_ioctl_set_no_receive_while_transmit(port,
+								  param_value);
+		break;
+	case P2PUART_IOCTL_GET_NO_RECEIVE_WHILE_TRANSMIT:
+		err = p2puart_ioctl_get_no_receive_while_transmit(port);
+		break;
+	case P2PUART_IOCTL_GET_TERMINATION_CAPABILITY:
+		err = p2puart_ioctl_get_termination_capability(port);
+		break;
+	case P2PUART_IOCTL_SET_TERMINATION:
+		if (get_user(param_value, (uint32_t __user *)arg))
+			return -EFAULT;
+		err = p2puart_ioctl_set_termination(port, param_value);
+		break;
+	case P2PUART_IOCTL_GET_TERMINATION:
+		err = p2puart_ioctl_get_termination(port);
+		break;
+	case P2PUART_IOCTL_GET_DUPLEX_CAPABILITY:
+		err = p2puart_ioctl_get_duplex_capability(port);
+		break;
+	case P2PUART_IOCTL_GET_TRANSMIT_CAPABILITY:
+		err = p2puart_ioctl_get_transmit_capability(port);
+		break;
+	case P2PUART_IOCTL_GET_RECEIVE_CAPABILITY:
+		err = p2puart_ioctl_get_receive_capability(port);
+		break;
+	case P2PUART_IOCTL_SET_CHARACTER_TIMEOUT_PERIOD:
+		if (get_user(param_value, (uint32_t __user *)arg))
+			return -EFAULT;
+		err = p2puart_ioctl_set_character_timeout_period(port,
+								 param_value);
+		break;
+	case P2PUART_IOCTL_GET_CHARACTER_TIMEOUT_PERIOD:
+		err = p2puart_ioctl_get_character_timeout_period(port);
+		break;
+	case P2PUART_IOCTL_SET_WAKEUP_PARITY_MODE:
+		if (get_user(param_value, (uint32_t __user *)arg))
+			return -EFAULT;
+		err = p2puart_ioctl_set_wakeup_parity_mode(port, param_value);
+		break;
+	case P2PUART_IOCTL_GET_WAKEUP_PARITY_MODE:
+		err = p2puart_ioctl_get_wakeup_parity_mode(port);
+		break;
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+	case P2PUART_IOCTL_UNITTEST_TRANSMIT_FULL_TX_BUFFER:
+		err = p2puart_ioctl_unittest_transmit_full_tx_buffer(port);
+		break;
+#endif
+
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+	case P2PUART_IOCTL_UNITTEST_TRANSMIT_TWO_FULL_TX_BUFFERS:
+		err = p2puart_ioctl_unittest_transmit_two_full_tx_buffers(port);
+		break;
+#endif
+
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+	case P2PUART_IOCTL_UNITTEST_BENCHMARK_TXBUF_WRITE:
+		err = p2puart_ioctl_unittest_benchmark_txbuf_write(port);
+		break;
+#endif
+
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+	case P2PUART_IOCTL_UNITTEST_BENCHMARK_RXBUF_READ:
+		err = p2puart_ioctl_unittest_benchmark_rxbuf_read(port);
+		break;
+#endif
+
+#ifdef DEBUG_WITH_UNITTEST_IOCTLS
+	case P2PUART_IOCTL_UNITTEST_BENCHMARK_RXBUF_READ:
+		err = p2puart_ioctl_unittest_benchmark_rxbuf_read(port);
+		break;
+#endif
+
+	default:
+		/* Don't print anything about unsupported ioctls,
+		because the linux kernel calls this function with
+		unsupported ioctls, such as TCFLSH.
+		(see tty_ioctl in drivers/tty/tty_io.c) */
+		break;
+	}
+
+	return err;
+}
+
+static const struct uart_ops serial_p2puart_ops = {
+	.tx_empty = p2puart_tx_empty,
+	.get_mctrl = p2puart_get_mctrl,
+	.set_mctrl = p2puart_set_mctrl,
+	.stop_tx = p2puart_stop_tx,
+	.start_tx = p2puart_start_tx,
+	.stop_rx = p2puart_stop_rx,
+	.break_ctl = p2puart_break_ctl,
+	.startup = p2puart_startup,
+	.shutdown = p2puart_shutdown,
+	.set_termios = p2puart_set_termios,
+	.throttle       = p2puart_throttle,
+         .unthrottle     = p2puart_unthrottle,
+	.type = p2puart_type,
+	.release_port = p2puart_release_port,
+	.request_port = p2puart_request_port,
+	.config_port = p2puart_config_port,
+	.verify_port = p2puart_verify_port,
+	.ioctl = p2puart_ioctl
+};
+
+/* The CONFIG_SERIAL_P2PUART_CONSOLE configuration mode was not tested.
+The code has been copied from sprd_serial.c from linux 4.14. */
+
+/* TODO: Think if we want to remove the serial console functions below. */
+
+#ifdef CONFIG_SERIAL_P2PUART_CONSOLE
+
+/**
+ * An unused serial console function.
+ * An unused and untested serial console function.
+ * Unused because CONFIG_SERIAL_P2PUART_CONSOLE is not defined.
+ */
+static void p2puart_console_putchar(struct uart_port *port, int ch)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_console_putchar");
+
+	/*  TODO: Implement this */
+}
+
+/**
+ * An unused serial console function.
+ * An unused and untested serial console function.
+ * Unused because CONFIG_SERIAL_P2PUART_CONSOLE is not defined.
+ */
+static void p2puart_console_write(struct console *co, const char *s,
+				  unsigned int count)
+{
+	struct uart_port *port = &p2puart_ports[co->index]->port;
+	int locked = 1;
+	unsigned long flags;
+
+	PRINT_FUNCTION_ENTRY("p2puart_console_write");
+
+	if (port->sysrq)
+		locked = 0;
+	else if (oops_in_progress)
+		locked = spin_trylock_irqsave(&port->lock, flags);
+	else
+		spin_lock_irqsave(&port->lock, flags);
+
+	uart_console_write(port, s, count, p2puart_console_putchar);
+
+	if (locked)
+		spin_unlock_irqrestore(&port->lock, flags);
+}
+
+/**
+ * An unused serial console function.
+ * An unused and untested serial console function.
+ * Unused because CONFIG_SERIAL_P2PUART_CONSOLE is not defined.
+ */
+static int __init p2puart_console_setup(struct console *co, char *options)
+{
+	struct uart_port *port;
+	int baud = 115200;
+	int bits = 8;
+	int parity = 'n';
+	int flow = 'n';
+
+	PRINT_FUNCTION_ENTRY("p2puart_console_setup");
+
+	if (co->index >= P2PUART_NR_MAX || co->index < 0)
+		co->index = 0;
+
+	port = &p2puart_ports[co->index]->port;
+	if (port == NULL) {
+		pr_info("serial port %d not yet initialized\n", co->index);
+		return -ENODEV;
+	}
+	if (options)
+		uart_parse_options(options, &baud, &parity, &bits, &flow);
+
+	return uart_set_options(port, co, baud, parity, bits, flow);
+}
+
+static struct uart_driver p2puart_uart_driver;
+static struct console p2puart_console = {
+	.name = P2PUART_TTY_NAME,
+	.write = p2puart_console_write,
+	.device = uart_console_device,
+	.setup = p2puart_console_setup,
+	.flags = CON_PRINTBUFFER,
+	.index = -1,
+	.data = &p2puart_uart_driver,
+};
+
+#define P2PUART_CONSOLE (&p2puart_console)
+
+/* Support for earlycon */
+
+/**
+ * An unused serial console function.
+ * An unused and untested serial console function.
+ * Unused because CONFIG_SERIAL_P2PUART_CONSOLE is not defined.
+ */
+static void p2puart_putc(struct uart_port *port, int c)
+{
+	PRINT_FUNCTION_ENTRY("p2puart_putc");
+
+	/* TODO: Implement this */
+}
+
+/**
+ * An unused serial console function.
+ * An unused and untested serial console function.
+ * Unused because CONFIG_SERIAL_P2PUART_CONSOLE is not defined.
+ */
+static void p2puart_early_write(struct console *con, const char *s, unsigned n)
+{
+	struct earlycon_device *dev = con->data;
+
+	uart_console_write(&dev->port, s, n, p2puart_putc);
+}
+
+/**
+ * An unused serial console function.
+ * An unused and untested serial console function.
+ * Unused because CONFIG_SERIAL_P2PUART_CONSOLE is not defined.
+ */
+static int __init p2puart_early_console_setup(struct earlycon_device *device,
+					      const char *opt)
+{
+	if (!device->port.membase)
+		return -ENODEV;
+
+	device->con->write = p2puart_early_write;
+	return 0;
+}
+
+OF_EARLYCON_DECLARE(p2puart_serial, "xlnx,axi4-lite-p2p-uart-1.0",
+		    p2puart_early_console_setup);
+OF_EARLYCON_DECLARE(p2puart_serial, "xlnx,axi4-p2p-uart-1.0",
+		    p2puart_early_console_setup);
+
+#else /* !CONFIG_SERIAL_P2PUART_CONSOLE */
+#define P2PUART_CONSOLE NULL
+#endif
+
+static struct uart_driver p2puart_uart_driver = {
+	.owner = THIS_MODULE,
+	.driver_name = "p2puart",
+	.dev_name = P2PUART_TTY_NAME,
+	.major = 0,
+	.minor = 0,
+	.nr = P2PUART_NR_MAX,
+	.cons = P2PUART_CONSOLE,
+};
+
+/**
+ * Returns the port index.
+ * Returns the port's index to the p2puart_ports array.
+ * This function was copied from the sprd_serial.c file (linux kernel 4.14).
+ * Range checking is done to make sure the returned index is valid.
+ * @param index The index that will be returned if dev->of_node equals 0 or
+ * if the call of_alias_get_id(dev->of_node, "serial") returns an error.
+ * @param dev A pointer to the device structure.
+ * @return An index into the p2puart_ports array.
+ */
+static int p2puart_probe_dt_alias(int index, struct device *dev)
+{
+	struct device_node *np;
+	int ret = index;
+
+	if (!IS_ENABLED(CONFIG_OF))
+		return ret;
+
+	np = dev->of_node;
+	if (!np)
+		return ret;
+
+	ret = of_alias_get_id(np, "serial");
+	if (ret < 0)
+		ret = index;
+	else if (ret >= ARRAY_SIZE(p2puart_ports) ||
+		 p2puart_ports[ret] != NULL) {
+		dev_warn(dev, "requested serial port %d not available.\n", ret);
+		ret = index;
+	}
+
+	printk("p2puart_probe_dt_alias done --> 0x%x",ret);
+
+	return ret;
+}
+
+/**
+ * platform driver remove function.
+ * remove function of struct platform_driver.
+ * @param pdev A pointer to the platform_device structure.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+#ifdef P2PUART_IS_EXTERNAL_PLATFORM_DEVICE
+static
+#endif
+	int
+	p2puart_remove(struct platform_device *pdev)
+{
+	struct p2puart_port *pp = platform_get_drvdata(pdev);
+
+	if (pp) {
+		uart_remove_one_port(&p2puart_uart_driver, &pp->port);
+		p2puart_ports[pp->port.line] = NULL;
+		p2puart_ports_num--;
+	}
+
+	if (!p2puart_ports_num)
+		uart_unregister_driver(&p2puart_uart_driver);
+
+	return 0;
+}
+
+#ifndef P2PUART_IS_EXTERNAL_PLATFORM_DEVICE
+EXPORT_SYMBOL(p2puart_remove);
+#endif
+
+/**
+ * Sets device's buffer offsets and sizes.
+ * Sets device's Rx and Tx buffers offsets and sizes and initialized the
+ * port's fifosize field.
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_set_buffer_offsets_and_sizes(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+
+	pp = to_p2puart_port(port);
+	pp->rx_buffer_size = p2puart_get_rx_buffer_size(port);
+	pp->rx_buffer_offset[0] =
+		p2puart_serial_in(port, COMCTRL_RX_BUF_ADDR_OFFSET);
+	pp->rx_buffer_offset[1] = pp->rx_buffer_offset[0] + pp->rx_buffer_size;
+	pp->tx_buffer_size = p2puart_get_tx_buffer_size(port);
+	pp->tx_buffer_offset[0] =
+		p2puart_serial_in(port, COMCTRL_TX_BUF_ADDR_OFFSET);
+	pp->tx_buffer_offset[1] = pp->tx_buffer_offset[0] + pp->tx_buffer_size;
+	port->fifosize = pp->tx_buffer_size;
+}
+
+/**
+ * Sets port's capabilities.
+ * Sets the port's capabilities in the p2puart_port structure, according
+ * to device capabilities.
+ * @param port A pointer to the uart_port structure.
+ */
+static void p2puart_set_port_capabilities(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+	uint32_t scap; /* Specific Capabilities Register */
+
+	pp = to_p2puart_port(port);
+	scap = p2puart_serial_in(port, P2P_SCAP);
+//	printk("SCAP  = %d",scap);
+	pp->maximum_baud_rate_khz = scap & SCAP_MAXIMUM_BAUD_RATE_KBPS_MASK;
+//	printk("MAX BAUD RATE: %d",pp->maximum_baud_rate_khz);
+	pp->full_half_duplex_capability = (scap & SCAP_FULL_HALF_DUPLEX_MASK) >>
+					  SCAP_FULL_HALF_DUPLEX_SHIFT;
+	pp->transceiver_termination_capability =
+		((scap & SCAP_TRANSCEIVER_TERMINATION_MASK) >>
+		 SCAP_TRANSCEIVER_TERMINATION_SHIFT);
+	pp->rx_channel_exists =
+		((scap & SCAP_RX_CHANNEL_EXISTS) ? true : false);
+	pp->tx_channel_exists =
+		((scap & SCAP_TX_CHANNEL_EXISTS) ? true : false);
+}
+
+/**
+ * Maps the device addresses.
+ * Maps a P2PUART device in order to make it accessible.
+ * The mapping is defined in the device tree.
+ * The device's address space includes both the registers and the Rx and Tx
+ * buffers.
+ */
+static int p2puart_map_memory(struct platform_device *pdev,
+			      struct uart_port *port)
+{
+	struct resource *res;
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res) {
+		dev_err(&pdev->dev, "Unable to get memory resource\n");
+		return -ENODEV;
+	}
+	port->mapbase = res->start;
+
+/*	port->mapbase = res->start;*/
+	
+	port->membase =
+		devm_ioremap(&pdev->dev, res->start, resource_size(res));
+
+	if (!port->membase) {
+		dev_err(&pdev->dev, "Unable to map registers\n");
+		return -ENOMEM;
+	}
+
+#ifdef DEBUG_PRINT_DEVICE_MAPPINGS
+	printk("virtual mapping:0x%08llx ",
+	       (unsigned long long int)port->membase);
+	printk("physical mapping:0x%08llx\n",
+	       (unsigned long long int)virt_to_phys(port->membase));
+#endif
+
+	return 0;
+}
+
+/**
+ * Gets the IRQ.
+ * Gets the IRQ using platform_get_irq() and writes it to the port's irq field.
+ * @param pdev A pointer to the platform_device structure.
+ * @param port A pointer to the uart_port structure.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+//static int p2puart_get_irq(struct platform_device *pdev, struct uart_port *port)
+//{
+//	int irq;
+//
+//	irq = platform_get_irq(pdev, 0);
+//	if (irq < 0) {
+//#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 3, 0)
+//		dev_err(&pdev->dev, "Couldn't get IRQ: %d\n", irq);
+//#endif
+//		return irq;
+//	}
+//	port->irq = irq;
+//	return 0;
+//}
+
+static int p2puart_get_irq(struct platform_device *pdev, struct uart_port *port)
+{
+    int irq = platform_get_irq(pdev, 0);
+    if (irq < 0) {
+        dev_err(&pdev->dev, "p2puart: Unable to get IRQ resource, error %d\n", irq);
+        return irq;
+    }
+    dev_info(&pdev->dev, "p2puart: platform_get_irq returned IRQ %d\n", irq);
+    port->irq = irq;
+    return 0;
+}
+
+
+/**
+ * Prints driver version.
+ * Prints driver name and version to kernel log (info level).
+ */
+static void p2puart_print_driver_version(void)
+{
+	pr_info("%s - version %s\n", P2PUART_DESC, P2PUART_VER);
+}
+
+#ifndef DISABLE_MEMORY_BUFFERS_QUICK_TEST
+/**
+ * Tests partially a device's memory buffer.
+ * Performs a quick partial test of a device's Rx or Tx memory buffer.
+ * The reason of the test is to protect against incorrect firmware
+ * implementation (mainly firmwares that don't support byte addressing).
+ * This test requires that all device's memory buffers are both readable and
+ * writable.
+ * This is a quick test: it writes only up to 10 bytes to the first 4 bytes
+ * of the memory buffer.
+ * If we test the whole memory buffer, this will increase system startup time.
+ * @param port A pointer to the uart_port structure.
+ * @param buffer_offset offset of the memory buffer to test.
+ * @param buffer_size size of the memory buffer.
+ * @return true if the test passes successfully; false otherwise.
+ */
+static bool p2puart_quick_test_memory_buffer(struct uart_port *port,
+					     unsigned int buffer_offset,
+					     unsigned int buffer_size)
+{
+	int i;
+
+	/* The following test patterns verify that the memory buffer supports
+	byte addressing.
+	This test also tests that the memory buffer is readable and
+	writable. */
+	static const char *test_patterns[] = { "0", "12", "345", "6789" };
+
+	char temp[4];
+
+	BUG_ON(buffer_size < sizeof(temp));
+
+	for (i = 0; i < sizeof(test_patterns) / sizeof(char *); ++i) {
+		size_t len;
+		len = strlen(test_patterns[i]);
+
+		BUG_ON(len > sizeof(temp));
+
+		memcpy_toio(port->membase + buffer_offset, test_patterns[i],len);
+		memcpy_fromio(temp, port->membase + buffer_offset, len);
+		if (memcmp(test_patterns[i], temp, len) != 0) {
+			printk("ERROR: P2PUART device"
+			       " byte addressing might be not implemented"
+			       " or some part of the DPR is read-only or"
+			       " write-only."
+			       " Buffer offset:%u"
+			       " Written (ASCII):%s"
+			       " Read (Hex):",
+			       buffer_offset, test_patterns[i]);
+			print_hex_dump_bytes("", DUMP_PREFIX_NONE, temp, len);
+
+			return false;
+		}
+	}
+
+	return true;
+}
+#endif /* DISABLE_MEMORY_BUFFERS_QUICK_TEST */
+
+#ifndef DISABLE_MEMORY_BUFFERS_QUICK_TEST
+/**
+ * Tests partially all device's memory buffers.
+ * Performs a quick partial test of all device's memory buffers.
+ * @param port A pointer to the uart_port structure.
+ * @return true if the test passes successfully; false otherwise.
+ */
+static bool p2puart_quick_test_all_memory_buffers(struct uart_port *port)
+{
+	struct p2puart_port *pp;
+	int i;
+	pp = to_p2puart_port(port);
+
+	for (i = 0; i < 2; ++i)
+		if (!p2puart_quick_test_memory_buffer(
+			    port, pp->tx_buffer_offset[i], pp->tx_buffer_size))
+			return false;
+
+	for (i = 0; i < 2; ++i)
+		if (!p2puart_quick_test_memory_buffer(
+			    port, pp->rx_buffer_offset[i], pp->rx_buffer_size))
+			return false;
+
+	return true;
+}
+#endif /* DISABLE_MEMORY_BUFFERS_QUICK_TEST */
+
+/**
+ * Checks that the IP block versions are supported.
+ * Checks the IP block versions (ComCtrl and P2PUART) are supported by the
+ * driver.
+ * @param pdev A pointer to the platform_device structure.
+ * @param port A pointer to the uart_port structure.
+ * @return true If the versions are supported; false otherwise.
+ */
+static bool p2puart_check_module_version(struct platform_device *pdev,
+					 struct uart_port *port)
+{
+	uint32_t mvr;
+	uint8_t cc_major;
+	uint8_t cc_minor;
+	uint8_t ep_major;
+	uint8_t ep_minor;
+
+	bool supported_cc = false;
+	bool supported_ep = false;
+
+	mvr = p2puart_serial_in(port, COMCTRL_MVR);
+
+	cc_major = (uint8_t)((mvr >> 24) & 0xffU);
+	cc_minor = (uint8_t)((mvr >> 16) & 0xffU);
+	ep_major = (uint8_t)((mvr >> 8) & 0xffU);
+	ep_minor = (uint8_t)(mvr & 0xffU);
+
+	if ((8 == cc_major) && (cc_minor >= 2))
+		supported_cc = true;
+
+	if ((5 == ep_major) && (ep_minor >= 1))
+		supported_ep = true;
+
+	if (!supported_cc)
+		dev_err(&pdev->dev, "Unsupported ComCtrl version:%d.%d\n",
+			(int)cc_major, (int)cc_minor);
+
+	if (!supported_ep)
+		dev_err(&pdev->dev, "Unsupported End-Point version:%d.%d\n",
+			(int)ep_major, (int)ep_minor);
+
+	return (supported_cc && supported_ep);
+}
+
+/**
+ * platform driver probe function.
+ * probe function of struct platform_driver.
+ * @param pdev A pointer to the platform_device structure.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+//#ifdef P2PUART_IS_EXTERNAL_PLATFORM_DEVICE
+//static
+//#endif
+
+
+
+static int p2puart_probe(struct platform_device *pdev)
+{
+//	printk("ENTERED PROBE FUNC");
+	struct uart_port *up;
+	struct p2puart_port *pp;
+	int index;
+	int ret;
+	uint32_t scp; /* Specific Channel Properties Register */
+
+	/* 1) Find a free slot in p2puart_ports[] */
+	for (index = 0; index < P2PUART_NR_MAX; index++)
+		if (!p2puart_ports[index])
+			break;
+	if (index == P2PUART_NR_MAX)
+		return -EBUSY;
+		
+	index = p2puart_probe_dt_alias(index, &pdev->dev);
+
+	/* Allocate p2puart port struct */
+	p2puart_ports[index] = devm_kzalloc(&pdev->dev,
+	                                    sizeof(*p2puart_ports[index]),
+	                                    GFP_KERNEL);
+	if (!p2puart_ports[index])
+		return -ENOMEM;
+		
+	up = &p2puart_ports[index]->port;
+	up->dev = &pdev->dev;
+	up->line = index;
+	up->type = PORT_16550A;  /* same as your snippet */
+	up->iotype = UPIO_MEM;
+	up->ops = &serial_p2puart_ops;
+	up->flags = UPF_BOOT_AUTOCONF;
+
+	/* Map memory resource */
+	ret = p2puart_map_memory(pdev, up);
+	if (ret < 0)
+	{
+		printk("ES: p2puart_map_memory failed!");	
+		return ret;
+	}
+	
+	if (!p2puart_check_module_version(pdev, up))
+	{
+		printk("ES: p2puart_check_module_version failed!");	
+		return -ENODEV;
+	}
+
+	ret = p2puart_get_irq(pdev, up);
+	if (ret < 0)
+	      return ret;
+
+
+	/* Grabs the clock freq from MPR */
+	up->uartclk = p2puart_get_clock_frequency(up);
+//	printk("CLOCK FREQ FROM MPR: %d",up->uartclk);
+	pp = to_p2puart_port(up);
+	
+//	printk("ES: up->uartclk --> 0x%x",up->uartclk);
+	
+	/* Next we do set_buffer_offsets_and_sizes(...) etc. */
+
+	p2puart_set_buffer_offsets_and_sizes(up);
+	p2puart_set_port_capabilities(up);
+
+	pp->temp_rx_buffer = devm_kmalloc(&pdev->dev,
+	                                  p2puart_get_rx_buffer_size(up),
+	                                  GFP_KERNEL);
+	if (!pp->temp_rx_buffer)
+		return -ENOMEM;
+
+	/* Retrieve the MSI IRQ from the resource. */
+	up->irq = platform_get_irq(pdev, 0);
+	if (up->irq < 0) {
+		dev_err(&pdev->dev,
+		        "No IRQ found, can't do interrupt-based operation\n");
+	} else {
+		ret = devm_request_irq(&pdev->dev, up->irq,
+		                       p2puart_handle_irq,IRQF_NO_THREAD | IRQF_SHARED,
+		                       "p2puart_irq", up);
+		//ret = devm_request_irq(&pdev->dev, up->irq, p2puart_handle_irq,0/* IRQF_SHARED*/, "p2puart_irq", up);
+		if (ret) {
+			dev_err(&pdev->dev, "request_irq(%d) failed: %d\n",
+			        up->irq, ret);
+			return ret;
+		}
+		dev_info(&pdev->dev, "MSI IRQ %d registered for p2puart\n", up->irq);
+	}
+
+
+	pp->mute_enabled = false;
+	pp->character_timeout_period = P2PUART_DEFAULT_CHARACTER_TIMEOUT;
+
+	scp = p2puart_serial_in(up, P2P_SCP);
+	printk(KERN_INFO "bit 2 of scp = %d\n",(scp>>2) & 1);
+	pp->termination_enable = ((scp & SCP_TRANSCEIVER_TERMINATION_MASK)?1:0);
+
+	/* number_of_stop_bits and parity fields will be updated by p2puart_set_termios */
+	pp->number_of_stop_bits = 0;
+	pp->parity = 0;
+	pp->rx_enabled = true;
+	pp->loopback = LOOPBACK_NONE;
+
+	//if (SCAP_ALWAYS_HALF_DUPLEX == pp->full_half_duplex_capability)
+		pp->no_receive_while_transmit = false; //doron change
+	//else
+		//pp->no_receive_while_transmit =
+			//p2puart_get_no_receive_while_transmit(up);
+	printk("no_receive_while_transmit == %d",pp->no_receive_while_transmit);		
+	//pp->no_receive_while_transmit = false; //Doron
+	pp->streaming = false; /* Use streaming mode by default */ //Doron Changes
+//	printk("NO REC WHILE TRANS = %d",pp->no_receive_while_transmit);
+	p2puart_raise_reset_rx_and_tx(up);
+	p2puart_set_rx_packet_size(up, 0);
+	p2puart_update_no_receive_while_transmit(up);
+
+	pp->tx_buffer_busy[0] = false;
+	pp->tx_buffer_busy[1] = false;
+
+#ifndef DISABLE_MEMORY_BUFFERS_QUICK_TEST
+	if (!p2puart_quick_test_all_memory_buffers(up))
+		return -EIO;
+#endif
+
+	snprintf(pp->name, sizeof(pp->name), "p2puart%d", up->line);
+
+	p2puart_mask_all_interrupts(up);
+
+	/* We won't do devm_request_irq for a shared poll approach anymore. */
+
+	/* If first port, do a uart_register_driver(...) etc. */
+	if (!p2puart_ports_num) {
+		p2puart_print_driver_version();
+		ret = uart_register_driver(&p2puart_uart_driver);
+		if (ret < 0) {
+			dev_err(&pdev->dev, "Failed to register p2puart driver\n");
+			return ret;
+		}
+	}
+	p2puart_ports_num++;
+
+	ret = uart_add_one_port(&p2puart_uart_driver, up);
+	if (ret) {
+		p2puart_ports[index] = NULL;
+		/* calls remove, etc. */
+		p2puart_remove(pdev);
+	/*	return ret; */
+	}
+
+	platform_set_drvdata(pdev, up);
+
+	dev_info(&pdev->dev, "p2puart probed successfully\n");
+	return ret;
+}
+
+#ifndef P2PUART_IS_EXTERNAL_PLATFORM_DEVICE
+EXPORT_SYMBOL(p2puart_probe);
+#endif
+
+#ifdef CONFIG_PM_SLEEP
+/**
+ * Suspends the port.
+ * Suspends the port (power management). Unsupported at the moment.
+ * @param dev A pointer to the device structure.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_suspend(struct device *dev)
+{
+	struct p2puart_port *pp = dev_get_drvdata(dev);
+
+	uart_suspend_port(&p2puart_uart_driver, &pp->port);
+
+	return 0;
+}
+
+/**
+ * Resumes the port.
+ * Resumes the port (power management). Unsupported at the moment.
+ * @param dev A pointer to the device structure.
+ * @return 0 upon success; Any other value indicates an error.
+ */
+static int p2puart_resume(struct device *dev)
+{
+	struct p2puart_port *pp = dev_get_drvdata(dev);
+
+	uart_resume_port(&p2puart_uart_driver, &pp->port);
+
+	return 0;
+}
+#endif
+
+static SIMPLE_DEV_PM_OPS(p2puart_pm_ops, p2puart_suspend, p2puart_resume);
+
+static const struct of_device_id serial_ids[] = {
+	{
+		.compatible = "xlnx,axi4-lite-p2p-uart-1.0",
+	},
+	{
+		.compatible = "xlnx,axi4-p2p-uart-1.0",
+	},
+	{}
+};
+MODULE_DEVICE_TABLE(of, serial_ids);
+
+#ifdef P2PUART_IS_EXTERNAL_PLATFORM_DEVICE
+static struct platform_driver p2puart_platform_driver = {
+	.probe  = p2puart_probe,
+	.remove = p2puart_remove,
+	.driver = {
+		.name = "p2puart",
+		.of_match_table = of_match_ptr(serial_ids),
+		.pm = &p2puart_pm_ops,
+	},
+};
+
+module_platform_driver(p2puart_platform_driver);
+#endif
+
+MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("Rafael BSP Team");
+MODULE_DESCRIPTION(P2PUART_DESC);
+MODULE_VERSION(P2PUART_VER);
+

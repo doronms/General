@@ -1,0 +1,47 @@
+diff --git a/mcu_p2puart.c b/mcu_p2puart.c
+--- a/mcu_p2puart.c
++++ b/mcu_p2puart.c
+@@ -1,3 +1,4 @@
++
+@@
+ #ifdef P2PUART_IS_EXTERNAL_PLATFORM_DEVICE
+ static
+ #endif
++static uint32_t p2puart_rx_try_drain(struct uart_port *port, uint32_t ipr)
++{
++    struct p2puart_port *pp = to_p2puart_port(port);
++    uint32_t ack = 0;
++    uint32_t c0, c1;
++
++    if (unlikely(!pp->rx_channel_exists))
++        return 0;
++
++    c0 = p2puart_serial_in(port, RXBUF0_CTRL);
++    c1 = p2puart_serial_in(port, RXBUF1_CTRL);
++
++    if ((ipr & IPR_RX0_MASK) || (c0 & (RXBUF_BUFFER_DONE_MASK | P2PUART_RXBUF_ALL_ERRORS_MASK)))
++        ack |= p2puart_rx_single_buffer(port, 0, ipr);
++
++    if ((ipr & IPR_RX1_MASK) || (c1 & (RXBUF_BUFFER_DONE_MASK | P2PUART_RXBUF_ALL_ERRORS_MASK)))
++        ack |= p2puart_rx_single_buffer(port, 1, ipr);
++
++    return ack;
++}
++
+ irqreturn_t p2puart_handle_irq(int irq, void *dev_id)
+ {
+     struct uart_port *port = dev_id;
+@@ -10,11 +10,8 @@ irqreturn_t p2puart_handle_irq(int irq, void *dev_id)
+         p2puart_handle_tx(port);
+     }
+     
+-    /* 3. RX side: Get back mask of successfully processed and CLEARED buffers */
+-    if (ipr & IPR_RX_MASK) {
+-        // CALL THE NEW FUNCTION SIGNATURE
+-        rx_ack_mask = p2puart_handle_rx(port, ipr); 
+-    }
++    /* 3. RX side: ALWAYS try draining HW RX buffers (even on TX-only IRQs) */
++    rx_ack_mask = p2puart_rx_try_drain(port, ipr);
+     
+     /* 4. Acknowledge Handled Interrupts (TX now, RX if it was processed) */
+     if (tx_ack_mask || rx_ack_mask) {
