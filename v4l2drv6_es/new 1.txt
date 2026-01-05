@@ -1,0 +1,63 @@
+obj-m += v4l_xdma.o
+
+v4l_xdma-objs := v4l_xdma_main.o libxdma.o xdma_thread.o kcu116_hw.o si5324drv.o video_in.o \
+                  fzetta_fmc/fzetta_fmc_ctlr.o \
+                  fzetta_fmc/fzetta_fmc_gpio.o \
+                  fzetta_fmc/fzetta_fmc_iic.o \
+                  fzetta_fmc/fzetta_fmc_init_table.o \
+                  fzetta_fmc/fzetta_fmc_spi.o \
+                  xil/spi_v4_10/src/xspi.o \
+                  xil/spi_v4_10/src/xspi_g.o \
+                  xil/spi_v4_10/src/xspi_options.o \
+                  xil/spi_v4_10/src/xspi_selftest.o \
+                  xil/spi_v4_10/src/xspi_sinit.o \
+                  xil/spi_v4_10/src/xspi_stats.o \
+                  xil/iic_v3_9/src/xiic.o \
+                  xil/iic_v3_9/src/xiic_dyn_master.o \
+                  xil/iic_v3_9/src/xiic_g.o \
+                  xil/iic_v3_9/src/xiic_intr.o \
+                  xil/iic_v3_9/src/xiic_l.o \
+                  xil/iic_v3_9/src/xiic_master.o \
+                  xil/iic_v3_9/src/xiic_multi_master.o \
+                  xil/iic_v3_9/src/xiic_options.o \
+                  xil/iic_v3_9/src/xiic_selftest.o \
+                  xil/iic_v3_9/src/xiic_sinit.o \
+                  xil/iic_v3_9/src/xiic_slave.o \
+                  xil/iic_v3_9/src/xiic_stats.o \
+                  xil/gpio_v4_9/src/xgpio.o \
+                  xil/gpio_v4_9/src/xgpio_extra.o \
+                  xil/gpio_v4_9/src/xgpio_g.o \
+                  xil/gpio_v4_9/src/xgpio_intr.o \
+                  xil/gpio_v4_9/src/xgpio_selftest.o \
+                  xil/gpio_v4_9/src/xgpio_sinit.o
+
+# 💡 Fix: pass the kernel's Module.symvers file to your build
+build:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) \
+		EXTRA_CFLAGS="-I$(PWD) -I$(PWD)/xil -I$(PWD)/xil/gpio_v4_9/src -I$(PWD)/xil/iic_v3_9/src -I$(PWD)/xil/spi_v4_10/src -I$(PWD)/fzetta_fmc" \
+		KBUILD_EXTRA_SYMBOLS=/lib/modules/$(shell uname -r)/build/Module.symvers \
+		modules
+
+load_man:
+	sudo insmod ./v4l_xdma.ko
+
+unload_man:
+	sudo rmmod ./v4l_xdma.ko
+
+install:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) \
+		KBUILD_EXTRA_SYMBOLS=/lib/modules/$(shell uname -r)/build/Module.symvers \
+		modules
+	sudo -- bash -c 'echo conspciv3 >> /etc/modules'	
+	sudo cp v4l_xdma.ko /lib/modules/`uname -r`/kernel/drivers/pci
+	sudo depmod
+	reboot
+
+uninstall:
+	sudo sed -i "/v4l_xdma/d" /etc/modules	
+	sudo rm /lib/modules/`uname -r`/kernel/drivers/pci/v4l_xdma.ko
+	reboot
+
+clean:
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean

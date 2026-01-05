@@ -1,0 +1,156 @@
+ERROR: Internal data stream error.
+DEBUG INFO: gstbasesrc.c(3072): gst_base_src_loop (): /GstPipeline:pipeline0/GstV4l2Src:v4l2src0:
+streaming stopped, reason not-negotiated (-4)
+
+
+gst-launch-1.0 -v v4l2src device=/dev/video0 ! videoconvert ! autovideosink
+
+gst-launch-1.0 -v v4l2src device=/dev/video0 ! \
+  "video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1" ! \
+  videoconvert ! autovideosink
+  
+  
+  
+  
+[  170.855412] stop_streaming: returning vb2 buffer 0
+[  170.855415] stop_streaming: returning vb2 buffer 6
+[  170.855416] stop_streaming: returning vb2 buffer 7
+[  170.855426] ------------[ cut here ]------------
+[  170.855427] WARNING: CPU: 12 PID: 2900 at drivers/media/common/videobuf2/videobuf2-core.c:1037 vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855435] Modules linked in: v4l_xdma(OE) v4l2_dv_timings videobuf2_dma_sg videobuf2_memops videobuf2_v4l2 videobuf2_common videodev mc snd_hda_codec_hdmi snd_hda_codec_realtek snd_hda_codec_generic ledtrig_audio nls_iso8859_1 i915 ttm drm_kms_helper cec rc_core i2c_algo_bit fb_sys_fops syscopyarea sysfillrect sysimgblt intel_rapl_msr snd_hda_intel intel_rapl_common snd_intel_dspcfg snd_intel_sdw_acpi x86_pkg_temp_thermal snd_hda_codec intel_powerclamp snd_hda_core coretemp snd_hwdep snd_pcm input_leds snd_seq_midi snd_seq_midi_event kvm_intel snd_rawmidi kvm snd_seq snd_seq_device snd_timer mei_hdcp crct10dif_pclmul snd ghash_clmulni_intel sha256_ssse3 sha1_ssse3 binfmt_misc aesni_intel crypto_simd cryptd gigabyte_wmi wmi_bmof soundcore mei_me mei hid_generic intel_hid acpi_tad acpi_pad sparse_keymap mac_hid usbhid hid ip6t_REJECT nf_reject_ipv6 xt_hl ip6t_rt ipt_REJECT nf_reject_ipv4 xt_LOG nf_log_syslog xt_limit xt_addrtype xt_tcpudp xt_conntrack nf_conntrack sch_fq_codel
+[  170.855470]  nf_defrag_ipv6 nf_defrag_ipv4 libcrc32c ip6table_filter ip6_tables msr parport_pc iptable_filter ppdev bpfilter lp parport drm ramoops pstore_blk reed_solomon pstore_zone efi_pstore ip_tables x_tables autofs4 r8169 nvme ahci xhci_pci crc32_pclmul e1000e nvme_core realtek libahci xhci_pci_renesas wmi video [last unloaded: v4l2_dv_timings]
+[  170.855485] CPU: 12 PID: 2900 Comm: gst-launch-1.0 Tainted: G           OE     5.15.0-139-generic #149~20.04.1-Ubuntu
+[  170.855487] Hardware name: Gigabyte Technology Co., Ltd. Z790 UD/Z790 UD, BIOS F6c 04/28/2023
+[  170.855488] RIP: 0010:vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855491] Code: 3f 89 c0 48 0f a3 05 28 21 7b e0 73 bd 48 8b 05 9f c7 00 00 48 85 c0 74 0f 48 8b 78 08 4c 89 e2 4c 89 ee e8 9b 49 00 00 eb a0 <0f> 0b 48 83 c4 08 5b 41 5c 41 5d 41 5e 41 5f 5d c3 cc cc cc cc 83
+[  170.855493] RSP: 0018:ffffaf5e0335fb40 EFLAGS: 00010002
+[  170.855494] RAX: ffff92104b060c10 RBX: dead000000000122 RCX: ffff921045fc52e0
+[  170.855495] RDX: 0000000000000001 RSI: 0000000000000006 RDI: ffff92104b060800
+[  170.855496] RBP: ffffaf5e0335fb70 R08: 0000000000000000 R09: ffffaf5e0335fac8
+[  170.855497] R10: 00000000735f706f R11: 00000000706f7473 R12: ffff92104b060800
+[  170.855497] R13: ffff921045fc50d0 R14: 0000000000000246 R15: ffff921045fc5328
+[  170.855498] FS:  00007fc43b102440(0000) GS:ffff921fbf700000(0000) knlGS:0000000000000000
+[  170.855499] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  170.855500] CR2: 0000561553fd4138 CR3: 0000000109d20000 CR4: 0000000000750ee0
+[  170.855501] PKRU: 55555554
+[  170.855502] Call Trace:
+[  170.855503]  <TASK>
+[  170.855505]  ? show_regs.cold+0x1a/0x1f
+[  170.855509]  ? vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855512]  ? __warn+0x8b/0xe0
+[  170.855515]  ? vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855517]  ? report_bug+0xd5/0x110
+[  170.855520]  ? handle_bug+0x39/0x90
+[  170.855522]  ? exc_invalid_op+0x19/0x70
+[  170.855523]  ? asm_exc_invalid_op+0x1b/0x20
+[  170.855526]  ? vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855529]  stop_streaming+0x137/0x1a2 [v4l_xdma]
+[  170.855536]  __vb2_queue_cancel+0x2d/0x2a0 [videobuf2_common]
+[  170.855538]  vb2_core_streamoff+0x16/0x70 [videobuf2_common]
+[  170.855541]  vb2_streamoff+0x18/0x40 [videobuf2_v4l2]
+[  170.855544]  vb2_ioctl_streamoff+0x46/0x50 [videobuf2_v4l2]
+[  170.855546]  v4l_streamoff+0x1d/0x30 [videodev]
+[  170.855554]  __video_do_ioctl+0x1c2/0x550 [videodev]
+[  170.855560]  ? futex_wake+0x7c/0x180
+[  170.855563]  video_usercopy+0x3af/0x900 [videodev]
+[  170.855569]  ? v4l_s_fmt+0x6c0/0x6c0 [videodev]
+[  170.855574]  ? futex_wake+0x7c/0x180
+[  170.855576]  video_ioctl2+0x15/0x20 [videodev]
+[  170.855582]  v4l2_ioctl+0x69/0xa0 [videodev]
+[  170.855586]  __x64_sys_ioctl+0x92/0xd0
+[  170.855589]  x64_sys_call+0x1e5f/0x1fa0
+[  170.855591]  do_syscall_64+0x54/0xb0
+[  170.855592]  ? __x64_sys_futex+0x7b/0x1c0
+[  170.855594]  ? __x64_sys_futex+0x7b/0x1c0
+[  170.855595]  ? syscall_exit_to_user_mode+0x2c/0x50
+[  170.855596]  ? exit_to_user_mode_prepare+0x3d/0x1c0
+[  170.855598]  ? do_syscall_64+0x61/0xb0
+[  170.855600]  ? syscall_exit_to_user_mode+0x2c/0x50
+[  170.855601]  ? x64_sys_call+0x1022/0x1fa0
+[  170.855602]  ? do_syscall_64+0x61/0xb0
+[  170.855603]  ? do_syscall_64+0x61/0xb0
+[  170.855604]  ? do_syscall_64+0x61/0xb0
+[  170.855605]  ? do_syscall_64+0x61/0xb0
+[  170.855606]  entry_SYSCALL_64_after_hwframe+0x6c/0xd6
+[  170.855608] RIP: 0033:0x7fc43b3f35cb
+[  170.855609] Code: 0f 1e fa 48 8b 05 c5 78 0d 00 64 c7 00 26 00 00 00 48 c7 c0 ff ff ff ff c3 66 0f 1f 44 00 00 f3 0f 1e fa b8 10 00 00 00 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 8b 0d 95 78 0d 00 f7 d8 64 89 01 48
+[  170.855610] RSP: 002b:00007ffe8630e298 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+[  170.855612] RAX: ffffffffffffffda RBX: 00007fc38002a100 RCX: 00007fc43b3f35cb
+[  170.855613] RDX: 000055602436b010 RSI: 0000000040045613 RDI: 0000000000000011
+[  170.855613] RBP: 00007fc38002a190 R08: 0000000000000003 R09: 0000000000000003
+[  170.855614] R10: 0000000000000010 R11: 0000000000000246 R12: 00007fc3800145c0
+[  170.855615] R13: 00007fc38002a100 R14: 00007fc38000c520 R15: 0000000000000001
+[  170.855616]  </TASK>
+[  170.855617] ---[ end trace d44c525de666c606 ]---
+[  170.855621] ------------[ cut here ]------------
+[  170.855621] WARNING: CPU: 12 PID: 2900 at drivers/media/common/videobuf2/videobuf2-core.c:1037 vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855625] Modules linked in: v4l_xdma(OE) v4l2_dv_timings videobuf2_dma_sg videobuf2_memops videobuf2_v4l2 videobuf2_common videodev mc snd_hda_codec_hdmi snd_hda_codec_realtek snd_hda_codec_generic ledtrig_audio nls_iso8859_1 i915 ttm drm_kms_helper cec rc_core i2c_algo_bit fb_sys_fops syscopyarea sysfillrect sysimgblt intel_rapl_msr snd_hda_intel intel_rapl_common snd_intel_dspcfg snd_intel_sdw_acpi x86_pkg_temp_thermal snd_hda_codec intel_powerclamp snd_hda_core coretemp snd_hwdep snd_pcm input_leds snd_seq_midi snd_seq_midi_event kvm_intel snd_rawmidi kvm snd_seq snd_seq_device snd_timer mei_hdcp crct10dif_pclmul snd ghash_clmulni_intel sha256_ssse3 sha1_ssse3 binfmt_misc aesni_intel crypto_simd cryptd gigabyte_wmi wmi_bmof soundcore mei_me mei hid_generic intel_hid acpi_tad acpi_pad sparse_keymap mac_hid usbhid hid ip6t_REJECT nf_reject_ipv6 xt_hl ip6t_rt ipt_REJECT nf_reject_ipv4 xt_LOG nf_log_syslog xt_limit xt_addrtype xt_tcpudp xt_conntrack nf_conntrack sch_fq_codel
+[  170.855647]  nf_defrag_ipv6 nf_defrag_ipv4 libcrc32c ip6table_filter ip6_tables msr parport_pc iptable_filter ppdev bpfilter lp parport drm ramoops pstore_blk reed_solomon pstore_zone efi_pstore ip_tables x_tables autofs4 r8169 nvme ahci xhci_pci crc32_pclmul e1000e nvme_core realtek libahci xhci_pci_renesas wmi video [last unloaded: v4l2_dv_timings]
+[  170.855657] CPU: 12 PID: 2900 Comm: gst-launch-1.0 Tainted: G        W  OE     5.15.0-139-generic #149~20.04.1-Ubuntu
+[  170.855658] Hardware name: Gigabyte Technology Co., Ltd. Z790 UD/Z790 UD, BIOS F6c 04/28/2023
+[  170.855659] RIP: 0010:vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855661] Code: 3f 89 c0 48 0f a3 05 28 21 7b e0 73 bd 48 8b 05 9f c7 00 00 48 85 c0 74 0f 48 8b 78 08 4c 89 e2 4c 89 ee e8 9b 49 00 00 eb a0 <0f> 0b 48 83 c4 08 5b 41 5c 41 5d 41 5e 41 5f 5d c3 cc cc cc cc 83
+[  170.855662] RSP: 0018:ffffaf5e0335fb40 EFLAGS: 00010002
+[  170.855663] RAX: ffff92104b062c10 RBX: dead000000000122 RCX: ffff921045fc52e0
+[  170.855664] RDX: ffff92104b062c10 RSI: 0000000000000006 RDI: ffff92104b062800
+[  170.855665] RBP: ffffaf5e0335fb70 R08: dead000000000100 R09: ffffaf5e0335fac8
+[  170.855665] R10: 00000000735f706f R11: 00000000706f7473 R12: ffff92104b062800
+[  170.855666] R13: ffff921045fc50d0 R14: 0000000000000246 R15: ffff921045fc5328
+[  170.855667] FS:  00007fc43b102440(0000) GS:ffff921fbf700000(0000) knlGS:0000000000000000
+[  170.855667] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  170.855668] CR2: 0000561553fd4138 CR3: 0000000109d20000 CR4: 0000000000750ee0
+[  170.855669] PKRU: 55555554
+[  170.855669] Call Trace:
+[  170.855670]  <TASK>
+[  170.855670]  ? show_regs.cold+0x1a/0x1f
+[  170.855672]  ? vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855674]  ? __warn+0x8b/0xe0
+[  170.855676]  ? vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855679]  ? report_bug+0xd5/0x110
+[  170.855680]  ? handle_bug+0x39/0x90
+[  170.855681]  ? exc_invalid_op+0x19/0x70
+[  170.855682]  ? asm_exc_invalid_op+0x1b/0x20
+[  170.855685]  ? vb2_buffer_done+0x157/0x1c0 [videobuf2_common]
+[  170.855687]  stop_streaming+0x137/0x1a2 [v4l_xdma]
+[  170.855693]  __vb2_queue_cancel+0x2d/0x2a0 [videobuf2_common]
+[  170.855696]  vb2_core_streamoff+0x16/0x70 [videobuf2_common]
+[  170.855698]  vb2_streamoff+0x18/0x40 [videobuf2_v4l2]
+[  170.855700]  vb2_ioctl_streamoff+0x46/0x50 [videobuf2_v4l2]
+[  170.855703]  v4l_streamoff+0x1d/0x30 [videodev]
+[  170.855708]  __video_do_ioctl+0x1c2/0x550 [videodev]
+[  170.855714]  ? futex_wake+0x7c/0x180
+[  170.855715]  video_usercopy+0x3af/0x900 [videodev]
+[  170.855721]  ? v4l_s_fmt+0x6c0/0x6c0 [videodev]
+[  170.855726]  ? futex_wake+0x7c/0x180
+[  170.855727]  video_ioctl2+0x15/0x20 [videodev]
+[  170.855732]  v4l2_ioctl+0x69/0xa0 [videodev]
+[  170.855737]  __x64_sys_ioctl+0x92/0xd0
+[  170.855739]  x64_sys_call+0x1e5f/0x1fa0
+[  170.855741]  do_syscall_64+0x54/0xb0
+[  170.855742]  ? __x64_sys_futex+0x7b/0x1c0
+[  170.855743]  ? __x64_sys_futex+0x7b/0x1c0
+[  170.855744]  ? syscall_exit_to_user_mode+0x2c/0x50
+[  170.855746]  ? exit_to_user_mode_prepare+0x3d/0x1c0
+[  170.855747]  ? do_syscall_64+0x61/0xb0
+[  170.855748]  ? syscall_exit_to_user_mode+0x2c/0x50
+[  170.855749]  ? x64_sys_call+0x1022/0x1fa0
+[  170.855751]  ? do_syscall_64+0x61/0xb0
+[  170.855752]  ? do_syscall_64+0x61/0xb0
+[  170.855753]  ? do_syscall_64+0x61/0xb0
+[  170.855753]  ? do_syscall_64+0x61/0xb0
+[  170.855754]  entry_SYSCALL_64_after_hwframe+0x6c/0xd6
+[  170.855756] RIP: 0033:0x7fc43b3f35cb
+[  170.855757] Code: 0f 1e fa 48 8b 05 c5 78 0d 00 64 c7 00 26 00 00 00 48 c7 c0 ff ff ff ff c3 66 0f 1f 44 00 00 f3 0f 1e fa b8 10 00 00 00 0f 05 <48> 3d 01 f0 ff ff 73 01 c3 48 8b 0d 95 78 0d 00 f7 d8 64 89 01 48
+[  170.855758] RSP: 002b:00007ffe8630e298 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+[  170.855759] RAX: ffffffffffffffda RBX: 00007fc38002a100 RCX: 00007fc43b3f35cb
+[  170.855760] RDX: 000055602436b010 RSI: 0000000040045613 RDI: 0000000000000011
+[  170.855760] RBP: 00007fc38002a190 R08: 0000000000000003 R09: 0000000000000003
+[  170.855761] R10: 0000000000000010 R11: 0000000000000246 R12: 00007fc3800145c0
+[  170.855762] R13: 00007fc38002a100 R14: 00007fc38000c520 R15: 0000000000000001
+[  170.855763]  </TASK>
+[  170.855763] ---[ end trace d44c525de666c607 ]---
+[  170.855764] VIN: stop_streaming exit
+ 
+
+
+
